@@ -1,0 +1,39 @@
+{
+  "summary": {
+    "status": "COMPLETED",
+    "task": "Visual Grounding for Vietnamese ID Card",
+    "output_format": "JSON with normalized coordinates [ymin, xmin, ymax, xmax] on 0-1000 scale"
+  },
+  "results": {
+    "name": {
+      "text": "DOAN HOANG LONG",
+      "coordinates": [948, 497, 979, 913],
+      "raw_bbox": {
+        "x0": 223,
+        "y0": 722,
+        "x1": 410,
+        "y1": 746
+      }
+    },
+    "dob": {
+      "text": "16/12/2000",
+      "coordinates": [983, 826, 1000, 998],
+      "raw_bbox": {
+        "x0": 371,
+        "y0": 749,
+        "x1": 449,
+        "y1": 762
+      }
+    }
+  },
+  "image_info": {
+    "width": 449,
+    "height": 762,
+    "coordinate_system": "OCR pixel coordinates"
+  },
+  "files_updated": [
+    "ocr_idcard.html - Updated fallback dimensions to match actual OCR data",
+    "ocr_result.json - Contains final normalized coordinates",
+    "verification_result.json - Contains verification analysis"
+  ]
+}

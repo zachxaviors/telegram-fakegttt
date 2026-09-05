@@ -1,0 +1,44 @@
+{
+  "analysis": {
+    "raw_ocr_data": {
+      "DOAN":  { "x0": 223, "y0": 722, "x1": 276, "y1": 740 },
+      "HOANG": { "x0": 284, "y0": 723, "x1": 351, "y1": 746 },
+      "LONG":  { "x0": 358, "y0": 728, "x1": 410, "y1": 743 },
+      "16/12/2000": { "x0": 371, "y0": 749, "x1": 449, "y1": 762 }
+    },
+    "max_x_from_data": 449,
+    "max_y_from_data": 762,
+    "note": "Image is at least 450px wide × 763px tall. Using these as the coordinate space bounds for normalization."
+  },
+  "combined_raw_boxes": {
+    "DOAN HOANG LONG": {
+      "x0": 223,
+      "y0": 722,
+      "x1": 410,
+      "y1": 746,
+      "method": "Union of DOAN, HOANG, LONG boxes: min(x0)=223, min(y0)=722, max(x1)=410, max(y1)=746"
+    },
+    "16/12/2000": {
+      "x0": 371,
+      "y0": 749,
+      "x1": 449,
+      "y1": 762,
+      "method": "Single OCR entry"
+    }
+  },
+  "normalized_0_1000": {
+    "method": "Each axis normalized independently: norm = round((value / max_of_that_axis) * 1000). max_x=449, max_y=762.",
+    "DOAN HOANG LONG": {
+      "ymin": 948,
+      "xmin": 497,
+      "ymax": 979,
+      "xmax": 913
+    },
+    "16/12/2000": {
+      "ymin": 983,
+      "xmin": 826,
+      "ymax": 1000,
+      "xmax": 998
+    }
+  }
+}

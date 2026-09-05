@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <!-- Yêu cầu trình duyệt/WebView KHÔNG cache lại trang này, để luôn tải
+         bản HTML/JS mới nhất mỗi khi Telegram mở WebApp (tránh trường hợp
+         Telegram giữ cache cũ khiến Key mới cấp không được nhận diện). -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <title>Công cụ chỉnh sửa ảnh AI</title>
+
+    <!-- ============================================================
+         SDK CHÍNH THỨC CỦA TELEGRAM CHO WEB APP (MINI APP)
+         Bắt buộc phải nhúng script này để dùng các hàm tg.sendData(),
+         tg.close(), tg.ready(), tg.expand(), v.v.
+    ============================================================ -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+    <style>
+        /* ==========================================================
+           BIẾN MÀU THEO GIAO DIỆN TELEGRAM (SÁNG / TỐI)
+           Telegram tự động bơm các biến CSS --tg-theme-... vào trang
+           dựa theo theme hiện tại của người dùng (Sáng hoặc Tối).
+           Ta khai báo giá trị fallback (dự phòng) phòng khi test trên
+           trình duyệt thường (không phải trong Telegram).
+        ========================================================== */
+        :root {
+            --tg-theme-bg-color: #ffffff;
+            --tg-theme-text-color: #222222;
+            --tg-theme-hint-color: #999999;
+            --tg-theme-link-color: #2481cc;
+            --tg-theme-button-color: #2481cc;
+            --tg-theme-button-text-color: #ffffff;
+            --tg-theme-secondary-bg-color: #f0f0f0;
+            --tg-theme-section-bg-color: #ffffff;
+            --tg-theme-section-separator-color: #e7e7e7;
+        }
+
+        * {
+            box-sizing: border-box;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            min-height: 100%;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--tg-theme-bg-color);
+            color: var(--tg-theme-text-color);
+            padding: 16px;
+            padding-bottom: 100px; /* chừa chỗ cho nút xác nhận cố định dưới cùng */
+        }
+
+        h1 {
+            font-size: 20px;
+            font-weight: 600;
+            margin: 8px 0 4px 0;
+        }
+
+        p.subtitle {
+            font-size: 14px;
+            color: var(--tg-theme-hint-color);
+            margin: 0 0 20px 0;
+        }
+
+        /* ---------------- Khối chọn ảnh ---------------- */
+        .section {
+            background-color: var(--tg-theme-section-bg-color);
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 16px;
+            border: 1px solid var(--tg-theme-section-separator-color);
+        }
+
+        .section-label {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--tg-theme-hint-color);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 10px;
+        }
+
+        /* Vùng xem trước ảnh đã chọn */
+        #image-preview-wrapper {
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            max-height: 280px;
+            border-radius: 10px;
+            background-color: var(--tg-theme-secondary-bg-color);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            margin-bottom: 12px;
+            border: 2px dashed var(--tg-theme-section-separator-color);
+        }
+
+        #image-preview-wrapper.has-image {
+            border-style: solid;
+        }
+
+        #image-preview {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: none;
+        }
+
+        #image-placeholder-text {
+            color: var(--tg-theme-hint-color);
+            font-size: 14px;
+            text-align: center;
+            padding: 0 20px;
+        }
+
+        /* Hàng 2 nút: Thư viện / Camera */
+        .image-picker-buttons {
+            display: flex;
+            gap: 10px;
+        }
+
+        .picker-btn {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            padding: 12px 8px;
+            border-radius: 10px;
+            border: none;
+            background-color: var(--tg-theme-secondary-bg-color);
+            color: var(--tg-theme-link-color);
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .picker-btn:active {
+            opacity: 0.7;
+        }
+
+        /* input file ẩn, được kích hoạt qua nút bấm tuỳ chỉnh */
+        input[type="file"] {
+            display: none;
+        }
+
+        /* ---------------- Khối nhập text ---------------- */
+        #new-text-input {
+            width: 100%;
+            min-height: 90px;
+            padding: 12px;
+            border-radius: 10px;
+            border: 1px solid var(--tg-theme-section-separator-color);
+            background-color: var(--tg-theme-secondary-bg-color);
+            color: var(--tg-theme-text-color);
+            font-size: 15px;
+            font-family: inherit;
+            resize: vertical;
+            outline: none;
+        }
+
+        #new-text-input::placeholder {
+            color: var(--tg-theme-hint-color);
+        }
+
+        #char-counter {
+            text-align: right;
+            font-size: 12px;
+            color: var(--tg-theme-hint-color);
+            margin-top: 6px;
+        }
+
+        /* ---------------- Thông báo lỗi/trạng thái ---------------- */
+        #status-message {
+            display: none;
+            font-size: 13px;
+            color: #e0245e;
+            background-color: rgba(224, 36, 94, 0.1);
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 16px;
+        }
+
+        #status-message.visible {
+            display: block;
+        }
+
+        /* ---------------- Nút xác nhận cố định dưới cùng ---------------- */
+        .confirm-bar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+            background-color: var(--tg-theme-bg-color);
+            border-top: 1px solid var(--tg-theme-section-separator-color);
+        }
+
+        #confirm-button {
+            width: 100%;
+            padding: 15px;
+            border: none;
+            border-radius: 12px;
+            background-color: var(--tg-theme-button-color);
+            color: var(--tg-theme-button-text-color);
+            font-size: 16px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        #confirm-button:active {
+            opacity: 0.85;
+        }
+
+        #confirm-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* Trạng thái đang xử lý (loading) trên nút xác nhận */
+        #confirm-button.loading {
+            position: relative;
+            color: transparent;
+        }
+
+        #confirm-button.loading::after {
+            content: "";
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 18px;
+            height: 18px;
+            margin: -9px 0 0 -9px;
+            border: 2px solid var(--tg-theme-button-text-color);
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* ---------------- Màn hình khoá bằng Key kích hoạt ---------------- */
+        #lock-screen {
+            position: fixed;
+            inset: 0;
+            z-index: 999;
+            background-color: var(--tg-theme-bg-color);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            text-align: center;
+        }
+
+        #lock-screen .lock-icon {
+            font-size: 42px;
+            margin-bottom: 12px;
+        }
+
+        #lock-screen h2 {
+            font-size: 18px;
+            margin: 0 0 6px 0;
+        }
+
+        #lock-screen p {
+            font-size: 13px;
+            color: var(--tg-theme-hint-color);
+            margin: 0 0 20px 0;
+        }
+
+        #license-key-input {
+            width: 100%;
+            max-width: 320px;
+            padding: 13px 14px;
+            border-radius: 10px;
+            border: 1px solid var(--tg-theme-section-separator-color);
+            background-color: var(--tg-theme-secondary-bg-color);
+            color: var(--tg-theme-text-color);
+            font-size: 15px;
+            text-align: center;
+            letter-spacing: 1px;
+            outline: none;
+            margin-bottom: 12px;
+        }
+
+        #license-key-input::placeholder {
+            letter-spacing: normal;
+        }
+
+        #activate-button {
+            width: 100%;
+            max-width: 320px;
+            padding: 13px;
+            border: none;
+            border-radius: 10px;
+            background-color: var(--tg-theme-button-color);
+            color: var(--tg-theme-button-text-color);
+            font-size: 15px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        #activate-button:active {
+            opacity: 0.85;
+        }
+
+        #license-error {
+            display: none;
+            font-size: 13px;
+            color: #e0245e;
+            margin-top: 12px;
+        }
+
+        #license-error.visible {
+            display: block;
+        }
+
+        /* Nội dung chính bị ẩn cho tới khi Key được xác thực thành công */
+        #main-app {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ================= MÀN HÌNH KHOÁ - YÊU CẦU NHẬP KEY THUÊ ================= -->
+    <div id="lock-screen">
+        <div class="lock-icon">🔒</div>
+        <h2>Yêu cầu Key kích hoạt</h2>
+        <p>Vui lòng nhập Key thuê bao được cấp để sử dụng công cụ.</p>
+        <input
+            type="text"
+            id="license-key-input"
+            placeholder="Nhập Key tại đây"
+            autocomplete="off"
+            autocapitalize="characters"
+        />
+        <button type="button" id="activate-button">🔑 Kích hoạt</button>
+        <div id="license-error"></div>
+    </div>
+
+    <!-- ================= NỘI DUNG CHÍNH (chỉ hiện sau khi Key hợp lệ) ================= -->
+    <div id="main-app">
+
+    <h1>✂️ Chỉnh sửa chữ trên ảnh</h1>
+    <p class="subtitle">Tải ảnh lên và nhập nội dung chữ mới, hệ thống AI sẽ tự động thay thế cho bạn.</p>
+
+    <!-- Thông báo lỗi validate (ẩn mặc định) -->
+    <div id="status-message"></div>
+
+    <!-- ================= KHỐI 1: CHỌN ẢNH ================= -->
+    <div class="section">
+        <div class="section-label">Bước 1 — Chọn ảnh</div>
+
+        <div id="image-preview-wrapper">
+            <img id="image-preview" alt="Ảnh xem trước" />
+            <span id="image-placeholder-text">Chưa có ảnh nào được chọn</span>
+        </div>
+
+        <div class="image-picker-buttons">
+            <button type="button" class="picker-btn" id="btn-gallery">
+                🖼️ Thư viện
+            </button>
+            <button type="button" class="picker-btn" id="btn-camera">
+                📷 Camera
+            </button>
+        </div>
+
+        <!-- Input chọn ảnh từ thư viện (không giới hạn accept capture) -->
+        <input type="file" id="file-gallery" accept="image/*" />
+        <!-- Input chụp ảnh trực tiếp bằng camera (capture="environment") -->
+        <input type="file" id="file-camera" accept="image/*" capture="environment" />
+    </div>
+
+    <!-- ================= KHỐI 2: NHẬP TEXT MỚI ================= -->
+    <div class="section">
+        <div class="section-label">Bước 2 — Nội dung chữ mới</div>
+        <textarea
+            id="new-text-input"
+            placeholder="Nhập nội dung chữ bạn muốn thay thế trên ảnh..."
+            maxlength="500"
+        ></textarea>
+        <div id="char-counter">0 / 500</div>
+    </div>
+
+    <!-- ================= NÚT XÁC NHẬN CỐ ĐỊNH DƯỚI CÙNG ================= -->
+    <div class="confirm-bar">
+        <button type="button" id="confirm-button">✅ XÁC NHẬN CHỈNH SỬA</button>
+    </div>
+
+    </div> <!-- Đóng #main-app -->
+
+    <script>
+        // ==========================================================
+        // CƠ CHẾ KEY THUÊ BAO (LICENSE KEY) — CÓ NGÀY HẾT HẠN
+        // ==========================================================
+        // Mục đích: Chỉ những khách đã được cấp Key hợp lệ (và còn hạn) mới
+        // được dùng công cụ.
+        //
+        // NGUỒN DANH SÁCH KEY: thay vì khai báo cứng trong file này, danh
+        // sách Key được ĐỌC TRỰC TIẾP từ file `keys.json` trên repo GitHub
+        // (qua raw.githubusercontent.com) mỗi khi khách bấm "Kích hoạt".
+        // Nhờ vậy, khi Bot Telegram tự động thêm Key mới vào keys.json
+        // (qua lệnh /key), Key đó có hiệu lực trên Web NGAY LẬP TỨC mà
+        // không cần sửa tay file index.html.
+        //
+        // LƯU Ý BẢO MẬT: đây vẫn là cơ chế kiểm tra phía CLIENT (JavaScript
+        // chạy trong trình duyệt khách) — ai rành kỹ thuật vẫn có thể mở
+        // "View Page Source" / DevTools để xem được nội dung keys.json
+        // (vì repo là public). Nếu cần bảo mật cao hơn, cần chuyển việc
+        // xác thực Key sang một Backend server riêng.
+        const LICENSE_KEYS_JSON_URL =
+            "https://raw.githubusercontent.com/zachxaviors/telegram-fakegttt/main/keys.json";
+
+        // Khoá lưu trạng thái đã kích hoạt trong bộ nhớ trình duyệt (để lần
+        // sau mở lại WebApp không phải nhập Key lại, cho tới khi Key hết hạn).
+        const LICENSE_STORAGE_KEY = "orchestrator_license_key";
+
+        const lockScreen = document.getElementById("lock-screen");
+        const mainApp = document.getElementById("main-app");
+        const licenseKeyInput = document.getElementById("license-key-input");
+        const activateButton = document.getElementById("activate-button");
+        const licenseError = document.getElementById("license-error");
+
+        // Tải danh sách Key mới nhất từ keys.json trên GitHub.
+        // Thêm query "?t=timestamp" để tránh trình duyệt/CDN trả về bản cache cũ.
+        async function fetchLicenseKeys() {
+            const cacheBuster = `?t=${Date.now()}`;
+            const response = await fetch(LICENSE_KEYS_JSON_URL + cacheBuster, {
+                cache: "no-store",
+            });
+            if (!response.ok) {
+                throw new Error(`Không tải được danh sách Key (HTTP ${response.status})`);
+            }
+            const data = await response.json();
+            return Array.isArray(data.keys) ? data.keys : [];
+        }
+
+        // Kiểm tra 1 chuỗi Key có hợp lệ và còn hạn hay không (bất đồng bộ
+        // vì cần tải danh sách Key mới nhất từ GitHub trước khi so sánh).
+        // Trả về { valid: true } hoặc { valid: false, reason: "..." }
+        async function validateLicenseKey(inputKey) {
+            const normalizedKey = (inputKey || "").trim().toUpperCase();
+            if (!normalizedKey) {
+                return { valid: false, reason: "Vui lòng nhập Key." };
+            }
+
+            let licenseKeys;
+            try {
+                licenseKeys = await fetchLicenseKeys();
+            } catch (error) {
+                console.error("Lỗi khi tải danh sách Key:", error);
+                return {
+                    valid: false,
+                    reason: "Không thể kết nối để kiểm tra Key. Vui lòng thử lại.",
+                };
+            }
+
+            const found = licenseKeys.find(
+                (item) => (item.key || "").toUpperCase() === normalizedKey
+            );
+
+            if (!found) {
+                return { valid: false, reason: "Key không tồn tại hoặc không đúng." };
+            }
+
+            // So sánh ngày hết hạn (tính đến hết ngày expires, giờ 23:59:59)
+            const expiryDate = new Date(`${found.expires}T23:59:59`);
+            const now = new Date();
+
+            if (now > expiryDate) {
+                return {
+                    valid: false,
+                    reason: `Key đã hết hạn sử dụng vào ngày ${found.expires}.`,
+                };
+            }
+
+            return { valid: true, key: found.key, expires: found.expires };
+        }
+
+        // Mở khoá giao diện chính, ẩn màn hình nhập Key.
+        function unlockApp() {
+            lockScreen.style.display = "none";
+            mainApp.style.display = "block";
+        }
+
+        // Xử lý khi bấm nút "Kích hoạt"
+        async function handleActivate() {
+            // Khoá nút + hiện trạng thái đang kiểm tra để khách biết đang xử lý
+            activateButton.disabled = true;
+            activateButton.textContent = "⏳ Đang kiểm tra...";
+            licenseError.classList.remove("visible");
+
+            const result = await validateLicenseKey(licenseKeyInput.value);
+
+            activateButton.disabled = false;
+            activateButton.textContent = "🔑 Kích hoạt";
+
+            if (!result.valid) {
+                licenseError.textContent = `❌ ${result.reason}`;
+                licenseError.classList.add("visible");
+                if (window.Telegram && window.Telegram.WebApp.HapticFeedback) {
+                    window.Telegram.WebApp.HapticFeedback.notificationOccurred("error");
+                }
+                return;
+            }
+
+            // Lưu lại Key đã kích hoạt thành công vào localStorage của trình
+            // duyệt, để lần sau mở WebApp không cần nhập lại (cho tới khi hết hạn).
+            try {
+                localStorage.setItem(
+                    LICENSE_STORAGE_KEY,
+                    JSON.stringify({ key: result.key, expires: result.expires })
+                );
+            } catch (e) {
+                // Bỏ qua nếu trình duyệt chặn localStorage (chế độ ẩn danh, v.v.)
+            }
+
+            unlockApp();
+        }
+
+        activateButton.addEventListener("click", handleActivate);
+        licenseKeyInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") handleActivate();
+        });
+
+        // Khi trang vừa tải: kiểm tra xem trình duyệt đã từng lưu 1 Key hợp
+        // lệ trước đó chưa (localStorage), nếu còn hạn thì tự động mở khoá
+        // luôn, không bắt khách nhập lại Key mỗi lần mở WebApp.
+        (async function autoCheckSavedLicense() {
+            try {
+                const saved = localStorage.getItem(LICENSE_STORAGE_KEY);
+                if (!saved) return;
+
+                const savedData = JSON.parse(saved);
+                const result = await validateLicenseKey(savedData.key);
+                if (result.valid) {
+                    unlockApp();
+                } else {
+                    // Key đã lưu nhưng hết hạn/không còn hợp lệ -> xoá đi
+                    localStorage.removeItem(LICENSE_STORAGE_KEY);
+                }
+            } catch (e) {
+                // Bỏ qua lỗi parse JSON hỏng, v.v.
+            }
+        })();
+
+        // ==========================================================
+        // CẤU HÌNH DỊCH VỤ LƯU TRỮ ẢNH TẠM (IMGBB - MIỄN PHÍ)
+        // ==========================================================
+        // LÝ DO CẦN BƯỚC NÀY:
+        //   Hàm tg.sendData() của Telegram chỉ cho phép gửi tối đa 4096 bytes
+        //   dữ liệu. Một ảnh chụp từ điện thoại khi encode Base64 thường nặng
+        //   vài trăm KB đến vài MB -> KHÔNG THỂ gửi thẳng qua sendData().
+        //
+        //   Giải pháp: WebApp tự upload ảnh lên ImgBB (dịch vụ ảnh miễn phí,
+        //   hỗ trợ CORS, không giới hạn dung lượng đáng kể cho ảnh thường)
+        //   để lấy về 1 đường link ảnh ngắn gọn, rồi chỉ gửi link đó (vài chục
+        //   ký tự) về Bot qua sendData() -> không còn vượt giới hạn 4096 bytes.
+        //
+        // CÁCH LẤY API KEY MIỄN PHÍ:
+        //   1. Truy cập https://api.imgbb.com/
+        //   2. Đăng nhập bằng Google/Email (miễn phí, không cần thẻ)
+        //   3. Copy "API key" được cấp và dán vào biến bên dưới
+        const IMGBB_API_KEY = "d6fc6259461d141f4920d582146e3c20";
+
+        // ==========================================================
+        // KHỞI TẠO ĐỐI TƯỢNG WEBAPP CỦA TELEGRAM
+        // ==========================================================
+        const tg = window.Telegram.WebApp;
+
+        // Báo cho Telegram biết WebApp đã sẵn sàng hiển thị
+        tg.ready();
+        // Mở rộng WebApp chiếm toàn bộ chiều cao màn hình có thể
+        tg.expand();
+
+        // ==========================================================
+        // LẤY THAM CHIẾU CÁC PHẦN TỬ DOM
+        // ==========================================================
+        const btnGallery = document.getElementById("btn-gallery");
+        const btnCamera = document.getElementById("btn-camera");
+        const fileGalleryInput = document.getElementById("file-gallery");
+        const fileCameraInput = document.getElementById("file-camera");
+        const imagePreview = document.getElementById("image-preview");
+        const imagePreviewWrapper = document.getElementById("image-preview-wrapper");
+        const imagePlaceholderText = document.getElementById("image-placeholder-text");
+        const newTextInput = document.getElementById("new-text-input");
+        const charCounter = document.getElementById("char-counter");
+        const confirmButton = document.getElementById("confirm-button");
+        const statusMessage = document.getElementById("status-message");
+
+        // Biến lưu chuỗi Base64 của ảnh đã chọn (chưa gồm phần "data:image/...;base64,")
+        // Biến này chỉ dùng để UPLOAD lên ImgBB, KHÔNG dùng để gửi trực tiếp
+        // qua sendData() vì quá lớn so với giới hạn 4096 bytes của Telegram.
+        let selectedImageBase64 = null;
+
+        // ==========================================================
+        // HÀM HIỂN THỊ THÔNG BÁO LỖI / TRẠNG THÁI
+        // ==========================================================
+        function showStatusMessage(message) {
+            statusMessage.textContent = message;
+            statusMessage.classList.add("visible");
+        }
+
+        function hideStatusMessage() {
+            statusMessage.classList.remove("visible");
+        }
+
+        // ==========================================================
+        // HÀM XỬ LÝ KHI NGƯỜI DÙNG CHỌN 1 FILE ẢNH (từ thư viện hoặc camera)
+        // Đọc file → chuyển sang Base64 → hiển thị ảnh xem trước
+        // ==========================================================
+        function handleFileSelected(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+
+            // Kiểm tra đúng định dạng ảnh
+            if (!file.type.startsWith("image/")) {
+                showStatusMessage("⚠️ Vui lòng chọn đúng định dạng file ảnh.");
+                return;
+            }
+
+            hideStatusMessage();
+
+            const reader = new FileReader();
+            reader.onload = function (e) {
+                // e.target.result có dạng: "data:image/png;base64,iVBORw0KG..."
+                const fullDataUrl = e.target.result;
+
+                // Hiển thị ảnh xem trước ngay trên giao diện
+                imagePreview.src = fullDataUrl;
+                imagePreview.style.display = "block";
+                imagePlaceholderText.style.display = "none";
+                imagePreviewWrapper.classList.add("has-image");
+
+                // Tách lấy phần Base64 thuần (bỏ tiền tố "data:image/...;base64,")
+                // vì Backend AI thường chỉ cần chuỗi base64 thuần để xử lý.
+                selectedImageBase64 = fullDataUrl.split(",")[1];
+            };
+            reader.onerror = function () {
+                showStatusMessage("❌ Đã có lỗi khi đọc file ảnh. Vui lòng thử lại.");
+            };
+            reader.readAsDataURL(file);
+        }
+
+        // Gắn sự kiện: bấm nút "Thư viện" → mở input file tương ứng
+        btnGallery.addEventListener("click", () => fileGalleryInput.click());
+        btnCamera.addEventListener("click", () => fileCameraInput.click());
+
+        // Gắn sự kiện: khi người dùng đã chọn xong 1 file
+        fileGalleryInput.addEventListener("change", handleFileSelected);
+        fileCameraInput.addEventListener("change", handleFileSelected);
+
+        // ==========================================================
+        // HIỂN THỊ SỐ KÝ TỰ ĐÃ NHẬP TRONG Ô TEXTAREA
+        // ==========================================================
+        newTextInput.addEventListener("input", () => {
+            charCounter.textContent = `${newTextInput.value.length} / 500`;
+        });
+
+        // ==========================================================
+        // HÀM UPLOAD ẢNH LÊN IMGBB, TRẢ VỀ URL ẢNH CÔNG KHAI
+        // ==========================================================
+        // ImgBB nhận ảnh base64 qua form-data trường "image", trả về JSON
+        // chứa link ảnh tại data.data.url (hoặc display_url).
+        async function uploadImageToImgBB(base64Data) {
+            const formData = new FormData();
+            formData.append("image", base64Data);
+
+            const response = await fetch(
+                `https://api.imgbb.com/1/upload?key=${IMGBB_API_KEY}`,
+                {
+                    method: "POST",
+                    body: formData,
+                }
+            );
+
+            if (!response.ok) {
+                throw new Error(`Upload thất bại với mã lỗi HTTP ${response.status}`);
+            }
+
+            const result = await response.json();
+            if (!result.success) {
+                throw new Error("ImgBB từ chối yêu cầu upload.");
+            }
+
+            // Ưu tiên lấy display_url (link xem trực tiếp ảnh)
+            return result.data.display_url || result.data.url;
+        }
+
+        // ==========================================================
+        // XỬ LÝ KHI NGƯỜI DÙNG BẤM NÚT "XÁC NHẬN CHỈNH SỬA"
+        // ==========================================================
+        confirmButton.addEventListener("click", async () => {
+            hideStatusMessage();
+
+            const newText = newTextInput.value.trim();
+
+            // ---- BƯỚC VALIDATE: kiểm tra đã chọn ảnh và đã nhập chữ chưa ----
+            if (!selectedImageBase64) {
+                showStatusMessage("⚠️ Vui lòng chọn một ảnh trước khi xác nhận.");
+                // Rung nhẹ để cảnh báo người dùng (haptic feedback của Telegram)
+                if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("error");
+                return;
+            }
+
+            if (!newText) {
+                showStatusMessage("⚠️ Vui lòng nhập nội dung chữ mới trước khi xác nhận.");
+                if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("error");
+                return;
+            }
+
+            if (!IMGBB_API_KEY || IMGBB_API_KEY === "YOUR_IMGBB_API_KEY_HERE") {
+                showStatusMessage(
+                    "⚠️ Chưa cấu hình IMGBB_API_KEY trong file index.html (xem hướng dẫn)."
+                );
+                return;
+            }
+
+            // ---- Khoá nút xác nhận + hiện trạng thái loading để tránh bấm nhiều lần ----
+            confirmButton.disabled = true;
+            confirmButton.classList.add("loading");
+
+            try {
+                // ---- BƯỚC A: UPLOAD ẢNH LÊN IMGBB ĐỂ LẤY URL CÔNG KHAI ----
+                // (Né giới hạn 4096 bytes của tg.sendData() bằng cách không
+                // gửi thẳng base64 khổng lồ về Bot, mà chỉ gửi 1 URL ngắn.)
+                const imageUrl = await uploadImageToImgBB(selectedImageBase64);
+
+                // ---- BƯỚC B: ĐÓNG GÓI DỮ LIỆU THÀNH CHUỖI JSON THỐNG NHẤT ----
+                const payload = {
+                    image_url: imageUrl,
+                    new_text: newText,
+                };
+                const jsonString = JSON.stringify(payload);
+
+                // ---- BƯỚC C: GỬI DỮ LIỆU NGƯỢC VỀ CHO BOT TELEGRAM XỬ LÝ ----
+                // Hàm tg.sendData() gửi chuỗi này về Bot dưới dạng
+                // update.message.web_app_data.data, đồng thời TỰ ĐỘNG đóng
+                // WebApp ngay sau khi gọi (ta vẫn gọi tg.close() tường minh
+                // thêm để đảm bảo tương thích trên mọi phiên bản client).
+                tg.sendData(jsonString);
+                tg.close();
+            } catch (error) {
+                // ---- Nếu có lỗi (upload thất bại, mất mạng, v.v.) ----
+                // khôi phục lại nút bấm để người dùng thử lại.
+                console.error("Lỗi khi xử lý xác nhận:", error);
+                showStatusMessage(
+                    "❌ Upload ảnh thất bại. Vui lòng kiểm tra kết nối mạng và thử lại."
+                );
+                confirmButton.disabled = false;
+                confirmButton.classList.remove("loading");
+            }
+        });
+    </script>
+</body>
+</html>
