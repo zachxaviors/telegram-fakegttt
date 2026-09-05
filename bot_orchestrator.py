@@ -98,12 +98,18 @@ logger = logging.getLogger("OrchestratorBot")
 # ==============================================================================
 # 3. HÀM GỌI API QWEN2.5-VL / MIMO-V2.5 (VISION MODEL)
 # ==============================================================================
-async def call_backend_inpaint(image_url: str, new_text: str) -> Optional[io.BytesIO]:
+async def call_backend_inpaint(image_url: str, new_text: str, progress_callback=None) -> Optional[io.BytesIO]:
+    if progress_callback:
+        await progress_callback("📥 Đang tải ảnh gốc...")
+    
     async with httpx.AsyncClient(timeout=30.0) as img_client:
         img_resp = await img_client.get(image_url)
         img_resp.raise_for_status()
         image_bytes = img_resp.content
         image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    if progress_callback:
+        await progress_callback("🔍 Đang phân tích tọa độ và font chữ...")
 
     async with httpx.AsyncClient(timeout=180.0) as client:
         ocr_resp = await client.post(
@@ -118,6 +124,9 @@ async def call_backend_inpaint(image_url: str, new_text: str) -> Optional[io.Byt
             logger.error("Backend /ocr returned no coordinates")
             return None
 
+        if progress_callback:
+            await progress_callback("✏️ Đang xóa chữ cũ và tái tạo ký tự mới...\n⏳ Vui lòng chờ 10-30 giây...")
+
         inpaint_resp = await client.post(
             f"{BACKEND_API_URL}/inpaint",
             json={
@@ -127,6 +136,13 @@ async def call_backend_inpaint(image_url: str, new_text: str) -> Optional[io.Byt
             },
         )
         inpaint_resp.raise_for_status()
+
+        render_method = inpaint_resp.headers.get("X-Render-Method", "unknown")
+        processing_ms = inpaint_resp.headers.get("X-Processing-Time-Ms", "?")
+        
+        if progress_callback:
+            method_label = "font matching cục bộ" if render_method == "local-font" else "AI inpainting"
+            await progress_callback(f"🎨 Đang hoàn thiện ảnh ({method_label}, {processing_ms}ms)...")
 
         buf = io.BytesIO(inpaint_resp.content)
         buf.seek(0)
@@ -667,6 +683,12 @@ async def web_app_data_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             "🤖 Hệ thống AI đang xử lý, vui lòng chờ trong giây lát..."
         )
 
+        async def update_progress(status_text: str):
+            try:
+                await processing_message.edit_text(status_text)
+            except Exception:
+                pass
+
         # --- Bước 5: Gửi hiệu ứng "đang tải ảnh" để trải nghiệm mượt hơn ---
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
 
@@ -674,6 +696,7 @@ async def web_app_data_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         result_image_buffer = await call_backend_inpaint(
             image_url=image_url,
             new_text=new_text,
+            progress_callback=update_progress,
         )
 
         # --- Bước 7: Trả kết quả về cho người dùng (in-memory binary, no disk) ---

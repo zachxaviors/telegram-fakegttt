@@ -5,13 +5,14 @@ Secure, validated, and optimized for production deployment.
 
 import asyncio
 import base64
+import glob
 import io
 import json
 import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 import cv2
 import httpx
@@ -21,7 +22,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from pydantic import BaseModel, Field, validator
 
 load_dotenv()
@@ -44,6 +45,27 @@ if not CKEY_API_KEY or not OPENAI_API_KEY:
     raise RuntimeError("CRITICAL: CKEY_API_KEY and OPENAI_API_KEY must be set in environment variables")
 
 THREAD_POOL = ThreadPoolExecutor(max_workers=4)
+
+FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+FONT_CACHE: List[str] = []
+
+def load_font_cache():
+    global FONT_CACHE
+    if os.path.isdir(FONTS_DIR):
+        FONT_CACHE = sorted(glob.glob(os.path.join(FONTS_DIR, "*.ttf")))
+        logger.info(f"Loaded {len(FONT_CACHE)} fonts from {FONTS_DIR}")
+    else:
+        logger.warning(f"Fonts directory not found: {FONTS_DIR}")
+
+load_font_cache()
+
+CCCD_FONT_PRIORITY = [
+    "Arial Narrow Bold",
+    "HelveticaNeue-CondensedBold",
+    "Arial Bold",
+    "Helvetica-Bold",
+    "HelveticaNeue-Bold",
+]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("InpaintingService")
@@ -321,6 +343,247 @@ def enhance_prompt_realism(original_prompt: str) -> str:
     )
     return f"{original_prompt}.{realism_suffix}"
 
+def find_best_font(target_height: int) -> Optional[str]:
+    for priority_name in CCCD_FONT_PRIORITY:
+        for font_path in FONT_CACHE:
+            if priority_name.lower().replace(" ", "").replace("-", "") in os.path.basename(font_path).lower().replace(" ", "").replace("-", ""):
+                try:
+                    test_font = ImageFont.truetype(font_path, target_height)
+                    bbox = test_font.getbbox("A")
+                    if bbox[3] - bbox[1] > 0:
+                        logger.info(f"Matched font: {os.path.basename(font_path)}")
+                        return font_path
+                except Exception:
+                    continue
+    if FONT_CACHE:
+        fallback = FONT_CACHE[0]
+        logger.warning(f"No priority font matched, falling back to: {os.path.basename(fallback)}")
+        return fallback
+    return None
+
+def analyze_text_style(img_np: np.ndarray, bbox: Tuple[int, int, int, int]) -> Dict[str, Any]:
+    x0, y0, x1, y1 = bbox
+    roi = img_np[y0:y1, x0:x1]
+    if roi.size == 0:
+        return {"height": max(1, y1 - y0), "color": (0, 0, 0), "weight": "bold"}
+    
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    avg_stroke_width = 0
+    if contours:
+        widths = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter > 0:
+                widths.append(2 * area / perimeter)
+        if widths:
+            avg_stroke_width = np.median(widths)
+    
+    text_pixels = roi[binary > 0]
+    if len(text_pixels) > 0:
+        avg_color = tuple(int(c) for c in np.median(text_pixels.reshape(-1, 3), axis=0))
+    else:
+        avg_color = (0, 0, 0)
+    
+    height = max(1, y1 - y0)
+    weight = "bold" if avg_stroke_width > height * 0.08 else "regular"
+    
+    return {
+        "height": height,
+        "color": avg_color,
+        "weight": weight,
+        "stroke_width": avg_stroke_width,
+    }
+
+def render_text_on_canvas(
+    cleaned_img_np: np.ndarray,
+    coordinates: dict,
+    new_text: str,
+    img_dims: Tuple[int, int],
+) -> np.ndarray:
+    result = cleaned_img_np.copy()
+    h, w = result.shape[:2]
+    
+    pil_img = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_img)
+    
+    name_bbox = None
+    for key in ["name_text", "name"]:
+        if key in coordinates:
+            name_bbox = normalize_coordinates(coordinates[key], w, h)
+            break
+    
+    if name_bbox is None:
+        logger.warning("No name_text coordinate found for text rendering")
+        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    
+    style = analyze_text_style(cleaned_img_np, name_bbox)
+    target_height = int(style["height"] * 0.85)
+    font_path = find_best_font(target_height)
+    
+    if font_path is None:
+        logger.warning("No font available, skipping local text rendering")
+        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    
+    try:
+        font_size = target_height
+        font = ImageFont.truetype(font_path, font_size)
+        test_bbox = font.getbbox(new_text)
+        text_w = test_bbox[2] - test_bbox[0]
+        region_w = name_bbox[2] - name_bbox[0]
+        
+        while text_w > region_w and font_size > 6:
+            font_size -= 1
+            font = ImageFont.truetype(font_path, font_size)
+            test_bbox = font.getbbox(new_text)
+            text_w = test_bbox[2] - test_bbox[0]
+        
+        text_x = name_bbox[0]
+        text_y = name_bbox[1] + int((name_bbox[3] - name_bbox[1] - (test_bbox[3] - test_bbox[1])) / 2)
+        
+        text_color = style["color"]
+        
+        shadow_offset = max(1, int(style.get("stroke_width", 1) * 0.3))
+        shadow_color = tuple(min(255, c + 40) for c in text_color)
+        draw.text((text_x + shadow_offset, text_y + shadow_offset), new_text, font=font, fill=shadow_color)
+        
+        draw.text((text_x, text_y), new_text, font=font, fill=text_color)
+        
+        result_pil = pil_img.filter(ImageFilter.GaussianBlur(radius=0.3))
+        result_np = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
+        
+        roi_y0, roi_y1 = max(0, text_y - 2), min(h, text_y + font_size + 4)
+        roi_x0, roi_x1 = max(0, text_x - 2), min(w, text_x + text_w + 4)
+        
+        original_roi = cleaned_img_np[roi_y0:roi_y1, roi_x0:roi_x1].astype(np.float64)
+        rendered_roi = result_np[roi_y0:roi_y1, roi_x0:roi_x1].astype(np.float64)
+        
+        if original_roi.size > 0 and rendered_roi.size > 0:
+            orig_mean = np.mean(original_roi)
+            rend_mean = np.mean(rendered_roi)
+            if rend_mean > 0:
+                scale_factor = orig_mean / rend_mean
+                rendered_roi = np.clip(rendered_roi * scale_factor, 0, 255)
+            
+            noise_std = np.std(original_roi) * 0.15
+            noise = np.random.normal(0, noise_std, rendered_roi.shape)
+            rendered_roi = np.clip(rendered_roi + noise, 0, 255)
+            
+            result_np[roi_y0:roi_y1, roi_x0:roi_x1] = rendered_roi.astype(np.uint8)
+        
+        logger.info(f"Text rendered locally with {os.path.basename(font_path)} at size {font_size}")
+        return result_np
+        
+    except Exception as e:
+        logger.error(f"Local text rendering failed: {e}, falling back to API inpainting")
+        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+def extract_glyph_templates(img_np: np.ndarray, bbox: Tuple[int, int, int, int]) -> Dict[str, np.ndarray]:
+    x0, y0, x1, y1 = bbox
+    roi = img_np[y0:y1, x0:x1]
+    if roi.size == 0:
+        return {}
+    
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    glyphs = {}
+    char_positions = []
+    for cnt in contours:
+        gx, gy, gw, gh = cv2.boundingRect(cnt)
+        if gw < 3 or gh < 3 or gw > (x1 - x0) * 0.5:
+            continue
+        char_positions.append((gx, gy, gw, gh))
+    
+    char_positions.sort(key=lambda p: p[0])
+    
+    for idx, (gx, gy, gw, gh) in enumerate(char_positions):
+        pad = 2
+        cy0 = max(0, gy - pad)
+        cy1 = min(roi.shape[0], gy + gh + pad)
+        cx0 = max(0, gx - pad)
+        cx1 = min(roi.shape[1], gx + gw + pad)
+        glyph_roi = roi[cy0:cy1, cx0:cx1].copy()
+        glyphs[f"glyph_{idx}"] = glyph_roi
+    
+    logger.info(f"Extracted {len(glyphs)} glyph templates from bbox")
+    return glyphs
+
+def composite_from_glyphs(
+    cleaned_img_np: np.ndarray,
+    coordinates: dict,
+    new_text: str,
+    img_dims: Tuple[int, int],
+) -> Optional[np.ndarray]:
+    name_bbox = None
+    for key in ["name_text", "name"]:
+        if key in coordinates:
+            name_bbox = normalize_coordinates(coordinates[key], img_dims[0], img_dims[1])
+            break
+    
+    if name_bbox is None:
+        return None
+    
+    glyphs = extract_glyph_templates(cleaned_img_np, name_bbox)
+    if not glyphs:
+        logger.warning("No glyphs extracted, cannot composite")
+        return None
+    
+    sample_glyph = next(iter(glyphs.values()))
+    glyph_h, glyph_w = sample_glyph.shape[:2]
+    
+    result = cleaned_img_np.copy()
+    x_cursor = name_bbox[0]
+    y_center = name_bbox[1] + (name_bbox[3] - name_bbox[1] - glyph_h) // 2
+    
+    spacing = int(glyph_w * 0.15)
+    
+    for char in new_text:
+        if char == " ":
+            x_cursor += glyph_w // 2 + spacing
+            continue
+        
+        best_glyph = None
+        best_score = float("inf")
+        for gname, gimg in glyphs.items():
+            gh, gw = gimg.shape[:2]
+            if abs(gh - glyph_h) > glyph_h * 0.3:
+                continue
+            score = abs(gw - glyph_w)
+            if score < best_score:
+                best_score = score
+                best_glyph = gimg
+        
+        if best_glyph is not None:
+            gh, gw = best_glyph.shape[:2]
+            paste_y = max(0, min(y_center, result.shape[0] - gh))
+            paste_x = max(0, min(x_cursor, result.shape[1] - gw))
+            
+            if paste_y + gh <= result.shape[0] and paste_x + gw <= result.shape[1]:
+                gray_glyph = cv2.cvtColor(best_glyph, cv2.COLOR_BGR2GRAY) if len(best_glyph.shape) == 3 else best_glyph
+                _, mask = cv2.threshold(gray_glyph, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                
+                roi = result[paste_y:paste_y+gh, paste_x:paste_x+gw]
+                if roi.shape == best_glyph.shape:
+                    mask_3ch = cv2.merge([mask, mask, mask])
+                    blended = cv2.bitwise_and(best_glyph, mask_3ch)
+                    inv_mask = cv2.bitwise_not(mask_3ch)
+                    bg_part = cv2.bitwise_and(roi, inv_mask)
+                    result[paste_y:paste_y+gh, paste_x:paste_x+gw] = cv2.add(blended, bg_part)
+            
+            x_cursor += gw + spacing
+        else:
+            x_cursor += glyph_w + spacing
+    
+    logger.info(f"Glyph compositing completed for {len(new_text)} characters")
+    return result
+
 async def call_openai_edit_api_secure(image_bytes: bytes, mask_buffer: io.BytesIO, prompt: str) -> io.BytesIO:
     enhanced_prompt = enhance_prompt_realism(prompt)
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
@@ -397,6 +660,36 @@ async def inpaint_image(req: InpaintRequest):
             (w, h)
         )
 
+        cleaned_np = cv2.imdecode(np.frombuffer(cleaned_image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        
+        local_result = await loop.run_in_executor(
+            THREAD_POOL,
+            render_text_on_canvas,
+            cleaned_np,
+            req.coordinates,
+            req.prompt,
+            (w, h),
+        )
+        
+        if local_result is not None and local_result.size > 0:
+            _, buf = cv2.imencode('.jpg', local_result, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            result_buffer = io.BytesIO(buf.tobytes())
+            result_buffer.seek(0)
+            
+            total_time = time.time() - start_time
+            logger.info(f"Local rendering completed in {total_time:.2f}s")
+            
+            return StreamingResponse(
+                result_buffer,
+                media_type="image/jpeg",
+                headers={
+                    "X-Processing-Time-Ms": str(round(total_time * 1000)),
+                    "X-Original-Dimensions": f"{w}x{h}",
+                    "X-Render-Method": "local-font",
+                }
+            )
+        
+        logger.info("Local rendering unavailable, falling back to API inpainting")
         mask_buffer = create_mask_with_perspective(cleaned_image_bytes, req.coordinates, (w, h))
 
         result_image_buffer = await call_openai_edit_api_secure(
@@ -406,7 +699,7 @@ async def inpaint_image(req: InpaintRequest):
         )
 
         total_time = time.time() - start_time
-        logger.info(f"Pipeline completed in {total_time:.2f}s")
+        logger.info(f"API inpainting completed in {total_time:.2f}s")
         
         result_image_buffer.seek(0)
         return StreamingResponse(
@@ -415,6 +708,7 @@ async def inpaint_image(req: InpaintRequest):
             headers={
                 "X-Processing-Time-Ms": str(round(total_time * 1000)),
                 "X-Original-Dimensions": f"{w}x{h}",
+                "X-Render-Method": "api-inpaint",
             }
         )
 
