@@ -101,15 +101,21 @@ logger = logging.getLogger("OrchestratorBot")
 # ==============================================================================
 # 3. HÀM GỌI API QWEN2.5-VL / MIMO-V2.5 (VISION MODEL)
 # ==============================================================================
-async def call_backend_inpaint(image_url: str, new_text: str, progress_callback=None) -> Optional[io.BytesIO]:
+async def call_backend_inpaint(image_url: str = None, image_base64: str = None, new_text: str = "", progress_callback=None) -> Optional[io.BytesIO]:
     if progress_callback:
-        await progress_callback("📥 Đang tải ảnh gốc...")
+        await progress_callback("📥 Đang xử lý ảnh...")
     
-    async with httpx.AsyncClient(timeout=30.0) as img_client:
-        img_resp = await img_client.get(image_url)
-        img_resp.raise_for_status()
-        image_bytes = img_resp.content
-        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    if image_base64:
+        pass
+    elif image_url:
+        async with httpx.AsyncClient(timeout=30.0) as img_client:
+            img_resp = await img_client.get(image_url)
+            img_resp.raise_for_status()
+            image_bytes = img_resp.content
+            image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    else:
+        logger.error("No image_url or image_base64 provided")
+        return None
 
     if progress_callback:
         await progress_callback("🔍 Đang phân tích tọa độ và font chữ...")
@@ -701,13 +707,14 @@ async def web_app_data_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         image_url: Optional[str] = payload.get("image_url")
+        image_base64: Optional[str] = payload.get("image_base64")
         new_text: Optional[str] = payload.get("new_text")
 
         # --- Bước 3: Kiểm tra tính hợp lệ của dữ liệu trước khi xử lý tiếp ---
-        if not image_url or not new_text:
+        if (not image_url and not image_base64) or not new_text:
             logger.warning(
-                "Dữ liệu WebApp thiếu trường bắt buộc | image_url=%s | new_text=%s",
-                bool(image_url), bool(new_text),
+                "Dữ liệu WebApp thiếu trường bắt buộc | image_url=%s | image_base64=%s | new_text=%s",
+                bool(image_url), bool(image_base64), bool(new_text),
             )
             await update.message.reply_text(
                 "⚠️ Thiếu dữ liệu ảnh hoặc văn bản. Vui lòng thao tác lại trên WebApp."
@@ -732,6 +739,7 @@ async def web_app_data_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         # --- Bước 6: Gọi FastAPI backend (OCR + Inpaint) ---
         result_image_buffer = await call_backend_inpaint(
             image_url=image_url,
+            image_base64=image_base64,
             new_text=new_text,
             progress_callback=update_progress,
         )

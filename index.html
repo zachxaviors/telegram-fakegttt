@@ -718,6 +718,33 @@
         }
 
         // ==========================================================
+        // HÀM NÉN ẢNH TRƯỚC KHI GỬI QUA SENDATA (giới hạn 4096 bytes)
+        // ==========================================================
+        async function compressImage(base64Data, maxSize, quality) {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    let w = img.width;
+                    let h = img.height;
+                    if (w > maxSize || h > maxSize) {
+                        const ratio = Math.min(maxSize / w, maxSize / h);
+                        w = Math.round(w * ratio);
+                        h = Math.round(h * ratio);
+                    }
+                    canvas.width = w;
+                    canvas.height = h;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, w, h);
+                    const compressed = canvas.toDataURL('image/jpeg', quality);
+                    resolve(compressed.split(',')[1]);
+                };
+                img.onerror = reject;
+                img.src = 'data:image/jpeg;base64,' + base64Data;
+            });
+        }
+
+        // ==========================================================
         // XỬ LÝ KHI NGƯỜI DÙNG BẤM NÚT "XÁC NHẬN CHỈNH SỬA"
         // ==========================================================
         confirmButton.addEventListener("click", async () => {
@@ -739,43 +766,25 @@
                 return;
             }
 
-            if (!IMGBB_API_KEY || IMGBB_API_KEY === "YOUR_IMGBB_API_KEY_HERE") {
-                showStatusMessage(
-                    "⚠️ Chưa cấu hình IMGBB_API_KEY trong file index.html (xem hướng dẫn)."
-                );
-                return;
-            }
-
             // ---- Khoá nút xác nhận + hiện trạng thái loading để tránh bấm nhiều lần ----
             confirmButton.disabled = true;
             confirmButton.classList.add("loading");
 
             try {
-                // ---- BƯỚC A: UPLOAD ẢNH LÊN IMGBB ĐỂ LẤY URL CÔNG KHAI ----
-                // (Né giới hạn 4096 bytes của tg.sendData() bằng cách không
-                // gửi thẳng base64 khổng lồ về Bot, mà chỉ gửi 1 URL ngắn.)
-                const imageUrl = await uploadImageToImgBB(selectedImageBase64);
+                const compressedBase64 = await compressImage(selectedImageBase64, 800, 0.7);
 
-                // ---- BƯỚC B: ĐÓNG GÓI DỮ LIỆU THÀNH CHUỖI JSON THỐNG NHẤT ----
                 const payload = {
-                    image_url: imageUrl,
+                    image_base64: compressedBase64,
                     new_text: newText,
                 };
                 const jsonString = JSON.stringify(payload);
 
-                // ---- BƯỚC C: GỬI DỮ LIỆU NGƯỢC VỀ CHO BOT TELEGRAM XỬ LÝ ----
-                // Hàm tg.sendData() gửi chuỗi này về Bot dưới dạng
-                // update.message.web_app_data.data, đồng thời TỰ ĐỘNG đóng
-                // WebApp ngay sau khi gọi (ta vẫn gọi tg.close() tường minh
-                // thêm để đảm bảo tương thích trên mọi phiên bản client).
                 tg.sendData(jsonString);
                 tg.close();
             } catch (error) {
-                // ---- Nếu có lỗi (upload thất bại, mất mạng, v.v.) ----
-                // khôi phục lại nút bấm để người dùng thử lại.
                 console.error("Lỗi khi xử lý xác nhận:", error);
                 showStatusMessage(
-                    "❌ Upload ảnh thất bại. Vui lòng kiểm tra kết nối mạng và thử lại."
+                    "❌ Xử lý ảnh thất bại. Vui lòng thử lại với ảnh nhỏ hơn."
                 );
                 confirmButton.disabled = false;
                 confirmButton.classList.remove("loading");
