@@ -159,6 +159,7 @@ async def call_backend_inpaint(image_url: str = None, image_base64: str = None, 
             await progress_callback(f"🎨 Đang hoàn thiện ảnh ({method_label}, {processing_ms}ms)...")
 
         buf = io.BytesIO(inpaint_resp.content)
+        buf.name = "result.jpg"
         buf.seek(0)
         return buf
 
@@ -453,10 +454,16 @@ async def key_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
         # --- Tự động lưu Key vào keys.json trên VPS ---
-        sync_success = await add_key_to_local_keys(formatted_key, expiry_date)
+        local_success = await add_key_to_local_keys(formatted_key, expiry_date)
+        github_success = await add_key_to_github(formatted_key, expiry_date)
+        sync_success = local_success and github_success
 
         if sync_success:
-            sync_status_line = "✅ Đã lưu vào hệ thống, khách có thể dùng ngay."
+            sync_status_line = "✅ Đã lưu vào hệ thống và đồng bộ lên WebApp."
+        elif local_success and not github_success:
+            sync_status_line = (
+                "✅ Đã lưu local, ⚠️ đồng bộ GitHub thất bại."
+            )
         else:
             sync_status_line = (
                 "⚠️ Lưu Key thất bại. Kiểm tra log Bot."
@@ -478,8 +485,8 @@ async def key_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         await update.message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
         logger.info(
-            "Đã cấp Key mới: %s | Thời hạn: %d ngày | Hết hạn: %s | Đồng bộ GitHub: %s",
-            formatted_key, valid_days, expiry_date, sync_success,
+            "Đã cấp Key mới: %s | Thời hạn: %d ngày | Hết hạn: %s | Lưu local: %s | Đồng bộ GitHub: %s",
+            formatted_key, valid_days, expiry_date, local_success, github_success,
         )
 
     except Exception as e:
@@ -737,12 +744,43 @@ async def web_app_data_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
 
         # --- Bước 6: Gọi FastAPI backend (OCR + Inpaint) ---
-        result_image_buffer = await call_backend_inpaint(
-            image_url=image_url,
-            image_base64=image_base64,
-            new_text=new_text,
-            progress_callback=update_progress,
-        )
+        try:
+            result_image_buffer = await call_backend_inpaint(
+                image_url=image_url,
+                image_base64=image_base64,
+                new_text=new_text,
+                progress_callback=update_progress,
+            )
+        except httpx.HTTPStatusError as http_err:
+            # Backend trả về mã lỗi HTTP (4xx/5xx) -> log rõ status + body
+            logger.error(
+                "Backend API lỗi HTTP cho user %s | status=%s | body=%s",
+                user.id,
+                http_err.response.status_code,
+                http_err.response.text[:500],
+            )
+            raise
+        except httpx.TimeoutException as timeout_err:
+            # Backend xử lý quá lâu hoặc không phản hồi kịp
+            logger.error(
+                "Backend API timeout cho user %s | url=%s | chi tiết: %s",
+                user.id, BACKEND_API_URL, timeout_err,
+            )
+            raise
+        except httpx.ConnectError as conn_err:
+            # Không mở được kết nối tới backend (service chưa chạy / sai cổng)
+            logger.error(
+                "Backend API không kết nối được cho user %s | url=%s | chi tiết: %s",
+                user.id, BACKEND_API_URL, conn_err,
+            )
+            raise
+        except httpx.RequestError as req_err:
+            # Các lỗi tầng transport khác của httpx (DNS, SSL, đọc/ghi socket)
+            logger.error(
+                "Backend API lỗi request [%s] cho user %s | url=%s | chi tiết: %s",
+                type(req_err).__name__, user.id, BACKEND_API_URL, req_err,
+            )
+            raise
 
         # --- Bước 7: Trả kết quả về cho người dùng (in-memory binary, no disk) ---
         if result_image_buffer:
@@ -766,7 +804,12 @@ async def web_app_data_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             pass
 
     except Exception as e:
-        logger.exception("Lỗi không xác định trong web_app_data_handler: %s", e)
+        # --- Log loại exception + traceback đầy đủ để truy vết nguyên nhân ---
+        logger.error(
+            "Lỗi trong web_app_data_handler cho user %s | loại: %s | chi tiết: %s",
+            user.id, type(e).__name__, e,
+        )
+        logger.exception("Traceback đầy đủ của web_app_data_handler:")
         await update.message.reply_text(
             "❌ Đã có lỗi hệ thống xảy ra. Vui lòng thử lại hoặc liên hệ hỗ trợ."
         )
@@ -883,6 +926,7 @@ async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             processing_ms = inpaint_resp.headers.get("X-Processing-Time-Ms", "?")
 
             result_buf = io.BytesIO(inpaint_resp.content)
+            result_buf.name = "result.jpg"
             result_buf.seek(0)
 
             debug_html = generate_debug_html(
@@ -914,8 +958,51 @@ async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         logger.info(f"Photo message processed for user {user.id}: method={render_method}, time={processing_ms}ms")
 
+    except httpx.HTTPStatusError as http_err:
+        # Backend trả về mã lỗi HTTP (4xx/5xx) -> log rõ status + body
+        logger.error(
+            "Backend API lỗi HTTP cho user %s | status=%s | body=%s",
+            user.id,
+            http_err.response.status_code,
+            http_err.response.text[:500],
+        )
+        await processing_msg.edit_text(
+            f"❌ Lỗi Backend (HTTP {http_err.response.status_code}). Vui lòng thử lại sau."
+        )
+    except httpx.TimeoutException as timeout_err:
+        # Backend xử lý quá lâu hoặc không phản hồi kịp
+        logger.error(
+            "Backend API timeout cho user %s | url=%s | chi tiết: %s",
+            user.id, BACKEND_API_URL, timeout_err,
+        )
+        await processing_msg.edit_text(
+            "❌ Backend xử lý quá lâu (timeout). Vui lòng thử lại với ảnh nhỏ hơn."
+        )
+    except httpx.ConnectError as conn_err:
+        # Không mở được kết nối tới backend (service chưa chạy / sai cổng)
+        logger.error(
+            "Backend API không kết nối được cho user %s | url=%s | chi tiết: %s",
+            user.id, BACKEND_API_URL, conn_err,
+        )
+        await processing_msg.edit_text(
+            "❌ Không kết nối được Backend. Vui lòng liên hệ hỗ trợ."
+        )
+    except httpx.RequestError as req_err:
+        # Các lỗi tầng transport khác của httpx (DNS, SSL, đọc/ghi socket)
+        logger.error(
+            "Backend API lỗi request [%s] cho user %s | url=%s | chi tiết: %s",
+            type(req_err).__name__, user.id, BACKEND_API_URL, req_err,
+        )
+        await processing_msg.edit_text(
+            "❌ Lỗi kết nối mạng khi gọi Backend. Vui lòng thử lại."
+        )
     except Exception as e:
-        logger.exception(f"Error processing photo message: {e}")
+        # --- Log loại exception + traceback đầy đủ để truy vết nguyên nhân ---
+        logger.error(
+            "Lỗi xử lý ảnh cho user %s | loại: %s | chi tiết: %s",
+            user.id, type(e).__name__, e,
+        )
+        logger.exception("Traceback đầy đủ của photo_message_handler:")
         await processing_msg.edit_text(f"❌ Lỗi xử lý: {str(e)[:200]}")
 
 

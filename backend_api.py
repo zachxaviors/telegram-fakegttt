@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple, Dict, Any, List
@@ -164,6 +165,13 @@ def decode_base64_image_safe(b64_string: str) -> Tuple[bytes, Tuple[int, int]]:
     return image_bytes, image.size
 
 def normalize_coordinates(bbox: list, img_w: int, img_h: int) -> Tuple[int, int, int, int]:
+    # Validate bbox: phải là list đúng 4 phần tử dạng số
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        logger.warning(f"Invalid bbox (type={type(bbox).__name__}, len={len(bbox) if isinstance(bbox, list) else 'N/A'}), returning zero bbox")
+        return (0, 0, 0, 0)
+    if not all(isinstance(c, (int, float)) for c in bbox):
+        logger.warning(f"Non-numeric bbox values: {bbox}")
+        return (0, 0, 0, 0)
     ymin, xmin, ymax, xmax = bbox
     max_val = max(ymin, xmin, ymax, xmax)
     
@@ -202,8 +210,9 @@ async def call_vision_api_secure(image_base64: str) -> dict:
                     f"- \"name_text\": Find the label \"Họ và tên\" or \"Full name\", then bound the actual name text below/beside it.\n"
                     f"- \"dob_text\": Find the label \"Ngày sinh\" or \"Date of birth\", then bound the date string (DD/MM/YYYY) beside it.\n"
                     f"Output format: {{\"name_text\": [ymin, xmin, ymax, xmax], \"dob_text\": [ymin, xmin, ymax, xmax]}}"
-                )
-            },
+                ),
+                "cache_control": {"type": "ephemeral"}
+                },
             {
                 "role": "user",
                 "content": [
@@ -232,6 +241,10 @@ async def call_vision_api_secure(image_base64: str) -> dict:
                     json_str = json_str.split("```json")[1].split("```")[0].strip()
                 elif "```" in json_str:
                     json_str = json_str.split("```")[1].split("```")[0].strip()
+                
+                match = re.search(r"\{.*\}", json_str, re.DOTALL)
+                if match:
+                    json_str = match.group()
                 
                 result = json.loads(json_str)
                 if not isinstance(result, dict):
@@ -432,77 +445,116 @@ def render_text_on_canvas(
     
     pil_img = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil_img)
-    
-    name_bbox = None
-    for key in ["name_text", "name"]:
-        if key in coordinates:
-            name_bbox = normalize_coordinates(coordinates[key], w, h)
-            break
-    
-    if name_bbox is None:
-        logger.warning("No name_text coordinate found for text rendering")
+
+    # --- Thu thập tất cả bbox hợp lệ từ coordinates (cả name_text, dob_text, và bất kỳ trường nào khác) ---
+    render_targets = []
+    # Thứ tự ưu tiên render: name trước, dob sau
+    priority_keys = ["name_text", "name", "dob_text", "dob"]
+    ordered_keys = [k for k in priority_keys if k in coordinates]
+    ordered_keys += [k for k in coordinates.keys() if k not in ordered_keys]
+
+    for key in ordered_keys:
+        bbox = coordinates[key]
+        normalized = normalize_coordinates(bbox, w, h)
+        # bbox = (0,0,0,0) nghĩa là normalize_coordinates detect invalid
+        if normalized == (0, 0, 0, 0):
+            logger.warning(f"Skipping invalid bbox for '{key}': {bbox}")
+            continue
+        render_targets.append((key, normalized))
+
+    if not render_targets:
+        logger.warning("No valid coordinates found for text rendering")
         return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    
-    style = analyze_text_style(cleaned_img_np, name_bbox)
-    target_height = int(style["height"] * 0.85)
-    font_path = find_best_font(target_height)
-    
-    if font_path is None:
-        logger.warning("No font available, skipping local text rendering")
-        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    
+
+    # --- Render new_text vào TỪNG bbox ---
     try:
-        font_size = target_height
-        font = ImageFont.truetype(font_path, font_size)
-        test_bbox = font.getbbox(new_text)
-        text_w = test_bbox[2] - test_bbox[0]
-        region_w = name_bbox[2] - name_bbox[0]
-        
-        while text_w > region_w and font_size > 6:
-            font_size -= 1
+        # Lưu lại vị trí + kích thước thực tế đã vẽ, để bước blend dùng đúng số liệu
+        drawn_regions = []
+
+        for key, target_bbox in render_targets:
+            style = analyze_text_style(cleaned_img_np, target_bbox)
+            target_height = int(style["height"] * 0.85)
+            font_path = find_best_font(target_height)
+
+            if font_path is None:
+                logger.warning(f"No font available for '{key}', skipping this region")
+                continue
+
+            font_size = target_height
             font = ImageFont.truetype(font_path, font_size)
             test_bbox = font.getbbox(new_text)
             text_w = test_bbox[2] - test_bbox[0]
-        
-        text_x = name_bbox[0]
-        text_y = name_bbox[1] + int((name_bbox[3] - name_bbox[1] - (test_bbox[3] - test_bbox[1])) / 2)
-        
-        text_color = style["color"]
-        
-        shadow_offset = max(1, int(style.get("stroke_width", 1) * 0.3))
-        shadow_color = tuple(min(255, c + 40) for c in text_color)
-        draw.text((text_x + shadow_offset, text_y + shadow_offset), new_text, font=font, fill=shadow_color)
-        
-        draw.text((text_x, text_y), new_text, font=font, fill=text_color)
-        
+            region_w = target_bbox[2] - target_bbox[0]
+
+            while text_w > region_w and font_size > 6:
+                font_size -= 1
+                font = ImageFont.truetype(font_path, font_size)
+                test_bbox = font.getbbox(new_text)
+                text_w = test_bbox[2] - test_bbox[0]
+
+            text_x = target_bbox[0]
+            text_y = target_bbox[1] + int(
+                (target_bbox[3] - target_bbox[1] - (test_bbox[3] - test_bbox[1])) / 2
+            )
+
+            text_color = style["color"]
+
+            shadow_offset = max(1, int(style.get("stroke_width", 1) * 0.3))
+            shadow_color = tuple(min(255, c + 40) for c in text_color)
+            draw.text(
+                (text_x + shadow_offset, text_y + shadow_offset),
+                new_text, font=font, fill=shadow_color,
+            )
+            draw.text((text_x, text_y), new_text, font=font, fill=text_color)
+
+            drawn_regions.append((key, text_x, text_y, text_w, font_size))
+
+            logger.info(
+                "Rendered text for region '%s' with %s at size %d",
+                key, os.path.basename(font_path), font_size,
+            )
+
+        if not drawn_regions:
+            logger.warning("No region was actually rendered (font unavailable)")
+            return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
         result_np = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-        
-        roi_y0, roi_y1 = max(0, text_y - 2), min(h, text_y + font_size + 4)
-        roi_x0, roi_x1 = max(0, text_x - 2), min(w, text_x + text_w + 4)
-        
-        text_roi = result_np[roi_y0:roi_y1, roi_x0:roi_x1].copy()
-        text_roi_blurred = cv2.GaussianBlur(text_roi, (3, 3), sigmaX=0.3)
-        result_np[roi_y0:roi_y1, roi_x0:roi_x1] = text_roi_blurred
-        
-        original_roi = cleaned_img_np[roi_y0:roi_y1, roi_x0:roi_x1].astype(np.float64)
-        rendered_roi = result_np[roi_y0:roi_y1, roi_x0:roi_x1].astype(np.float64)
-        
-        if original_roi.size > 0 and rendered_roi.size > 0:
-            orig_mean = np.mean(original_roi)
-            rend_mean = np.mean(rendered_roi)
-            if rend_mean > 0:
-                scale_factor = orig_mean / rend_mean
-                rendered_roi = np.clip(rendered_roi * scale_factor, 0, 255)
-            
-            noise_std = np.std(original_roi) * 0.15
-            noise = np.random.normal(0, noise_std, rendered_roi.shape)
-            rendered_roi = np.clip(rendered_roi + noise, 0, 255)
-            
-            result_np[roi_y0:roi_y1, roi_x0:roi_x1] = rendered_roi.astype(np.uint8)
-        
-        logger.info(f"Text rendered locally with {os.path.basename(font_path)} at size {font_size}")
+
+        # --- Post-process: blur nhẹ + hoà sáng/nhiễu cho từng vùng đã vẽ ---
+        for key, text_x, text_y, text_w, font_size in drawn_regions:
+            roi_y0, roi_y1 = max(0, text_y - 2), min(h, text_y + font_size + 4)
+            roi_x0, roi_x1 = max(0, text_x - 2), min(w, text_x + text_w + 4)
+
+            if roi_y1 <= roi_y0 or roi_x1 <= roi_x0:
+                continue
+
+            text_roi = result_np[roi_y0:roi_y1, roi_x0:roi_x1].copy()
+            text_roi_blurred = cv2.GaussianBlur(text_roi, (3, 3), sigmaX=0.3)
+            result_np[roi_y0:roi_y1, roi_x0:roi_x1] = text_roi_blurred
+
+            original_roi = cleaned_img_np[roi_y0:roi_y1, roi_x0:roi_x1].astype(np.float64)
+            rendered_roi = result_np[roi_y0:roi_y1, roi_x0:roi_x1].astype(np.float64)
+
+            if original_roi.size > 0 and rendered_roi.size > 0:
+                orig_mean = np.mean(original_roi)
+                rend_mean = np.mean(rendered_roi)
+                if rend_mean > 0:
+                    scale_factor = orig_mean / rend_mean
+                    rendered_roi = np.clip(rendered_roi * scale_factor, 0, 255)
+
+                noise_std = np.std(original_roi) * 0.15
+                noise = np.random.normal(0, noise_std, rendered_roi.shape)
+                rendered_roi = np.clip(rendered_roi + noise, 0, 255)
+
+                result_np[roi_y0:roi_y1, roi_x0:roi_x1] = rendered_roi.astype(np.uint8)
+
+        logger.info(
+            "Text rendered locally for %d region(s): %s",
+            len(drawn_regions),
+            ", ".join(key for key, _, _, _, _ in drawn_regions),
+        )
         return result_np
-        
+
     except Exception as e:
         logger.error(f"Local text rendering failed: {e}, falling back to API inpainting")
         return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
@@ -546,67 +598,87 @@ def composite_from_glyphs(
     new_text: str,
     img_dims: Tuple[int, int],
 ) -> Optional[np.ndarray]:
-    name_bbox = None
-    for key in ["name_text", "name"]:
-        if key in coordinates:
-            name_bbox = normalize_coordinates(coordinates[key], img_dims[0], img_dims[1])
-            break
-    
-    if name_bbox is None:
-        return None
-    
-    glyphs = extract_glyph_templates(cleaned_img_np, name_bbox)
-    if not glyphs:
-        logger.warning("No glyphs extracted, cannot composite")
-        return None
-    
-    sample_glyph = next(iter(glyphs.values()))
-    glyph_h, glyph_w = sample_glyph.shape[:2]
-    
-    result = cleaned_img_np.copy()
-    x_cursor = name_bbox[0]
-    y_center = name_bbox[1] + (name_bbox[3] - name_bbox[1] - glyph_h) // 2
-    
-    spacing = int(glyph_w * 0.15)
-    
-    for char in new_text:
-        if char == " ":
-            x_cursor += glyph_w // 2 + spacing
+    # --- Thu thập tất cả bbox hợp lệ (cả name_text, dob_text, và trường khác) ---
+    composite_targets = []
+    priority_keys = ["name_text", "name", "dob_text", "dob"]
+    ordered_keys = [k for k in priority_keys if k in coordinates]
+    ordered_keys += [k for k in coordinates.keys() if k not in ordered_keys]
+
+    for key in ordered_keys:
+        normalized = normalize_coordinates(coordinates[key], img_dims[0], img_dims[1])
+        # bbox = (0,0,0,0) nghĩa là normalize_coordinates detect invalid
+        if normalized == (0, 0, 0, 0):
+            logger.warning(f"Skipping invalid bbox for '{key}' in glyph compositing")
             continue
-        
-        best_glyph = None
-        best_score = float("inf")
-        for gname, gimg in glyphs.items():
-            gh, gw = gimg.shape[:2]
-            if abs(gh - glyph_h) > glyph_h * 0.3:
+        composite_targets.append((key, normalized))
+
+    if not composite_targets:
+        logger.warning("No valid coordinates found for glyph compositing")
+        return None
+
+    result = cleaned_img_np.copy()
+    composited_regions = 0
+
+    # --- Ghép ký tự vào TỪNG vùng, mỗi vùng dùng glyph template riêng của nó ---
+    for key, target_bbox in composite_targets:
+        glyphs = extract_glyph_templates(cleaned_img_np, target_bbox)
+        if not glyphs:
+            logger.warning(f"No glyphs extracted for '{key}', skipping this region")
+            continue
+
+        sample_glyph = next(iter(glyphs.values()))
+        glyph_h, glyph_w = sample_glyph.shape[:2]
+
+        x_cursor = target_bbox[0]
+        y_center = target_bbox[1] + (target_bbox[3] - target_bbox[1] - glyph_h) // 2
+
+        spacing = int(glyph_w * 0.15)
+
+        for char in new_text:
+            if char == " ":
+                x_cursor += glyph_w // 2 + spacing
                 continue
-            score = abs(gw - glyph_w)
-            if score < best_score:
-                best_score = score
-                best_glyph = gimg
-        
-        if best_glyph is not None:
-            gh, gw = best_glyph.shape[:2]
-            paste_y = max(0, min(y_center, result.shape[0] - gh))
-            paste_x = max(0, min(x_cursor, result.shape[1] - gw))
-            
-            if paste_y + gh <= result.shape[0] and paste_x + gw <= result.shape[1]:
-                gray_glyph = cv2.cvtColor(best_glyph, cv2.COLOR_BGR2GRAY) if len(best_glyph.shape) == 3 else best_glyph
-                _, mask = cv2.threshold(gray_glyph, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-                
-                roi = result[paste_y:paste_y+gh, paste_x:paste_x+gw]
-                if roi.shape == best_glyph.shape:
-                    mask_3ch = cv2.merge([mask, mask, mask])
-                    blended = cv2.bitwise_and(best_glyph, mask_3ch)
-                    inv_mask = cv2.bitwise_not(mask_3ch)
-                    bg_part = cv2.bitwise_and(roi, inv_mask)
-                    result[paste_y:paste_y+gh, paste_x:paste_x+gw] = cv2.add(blended, bg_part)
-            
-            x_cursor += gw + spacing
-        else:
-            x_cursor += glyph_w + spacing
-    
-    logger.info(f"Glyph compositing completed for {len(new_text)} characters")
+
+            best_glyph = None
+            best_score = float("inf")
+            for gname, gimg in glyphs.items():
+                gh, gw = gimg.shape[:2]
+                if abs(gh - glyph_h) > glyph_h * 0.3:
+                    continue
+                score = abs(gw - glyph_w)
+                if score < best_score:
+                    best_score = score
+                    best_glyph = gimg
+
+            if best_glyph is not None:
+                gh, gw = best_glyph.shape[:2]
+                paste_y = max(0, min(y_center, result.shape[0] - gh))
+                paste_x = max(0, min(x_cursor, result.shape[1] - gw))
+
+                if paste_y + gh <= result.shape[0] and paste_x + gw <= result.shape[1]:
+                    gray_glyph = cv2.cvtColor(best_glyph, cv2.COLOR_BGR2GRAY) if len(best_glyph.shape) == 3 else best_glyph
+                    _, mask = cv2.threshold(gray_glyph, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+                    roi = result[paste_y:paste_y+gh, paste_x:paste_x+gw]
+                    if roi.shape == best_glyph.shape:
+                        mask_3ch = cv2.merge([mask, mask, mask])
+                        blended = cv2.bitwise_and(best_glyph, mask_3ch)
+                        inv_mask = cv2.bitwise_not(mask_3ch)
+                        bg_part = cv2.bitwise_and(roi, inv_mask)
+                        result[paste_y:paste_y+gh, paste_x:paste_x+gw] = cv2.add(blended, bg_part)
+
+                x_cursor += gw + spacing
+            else:
+                x_cursor += glyph_w + spacing
+
+        composited_regions += 1
+        logger.info(f"Glyph compositing done for region '{key}' ({len(new_text)} characters)")
+
+    if composited_regions == 0:
+        logger.warning("No region could be composited from glyphs")
+        return None
+
+    logger.info(f"Glyph compositing completed for {composited_regions} region(s)")
     return result
 
 async def call_openai_edit_api_secure(image_bytes: bytes, mask_buffer: io.BytesIO, prompt: str) -> io.BytesIO:
@@ -628,7 +700,24 @@ async def call_openai_edit_api_secure(image_bytes: bytes, mask_buffer: io.BytesI
     async with httpx.AsyncClient(timeout=120.0) as client:
         try:
             response = await client.post(OPENAI_EDIT_URL, headers=headers, data=data, files=files)
-            
+
+            # --- 404: endpoint image-edit không tồn tại trên proxy đang dùng ---
+            # Format multipart /images/edits là đặc thù Alibaba Cloud / OpenAI;
+            # nhiều proxy trung gian (vd. api.xah.io) không expose route này.
+            if response.status_code == 404:
+                logger.error(
+                    "Image edit endpoint KHONG KHA DUNG (HTTP 404) | url=%s | model=%s | body=%s",
+                    OPENAI_EDIT_URL, OPENAI_IMAGE_MODEL, response.text[:500],
+                )
+                logger.error(
+                    "Proxy hien tai khong ho tro route /images/edits. "
+                    "Kiem tra lai OPENAI_EDIT_URL trong .env, hoac dung provider co ho tro image editing."
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail="Image editing endpoint not available on configured provider (404)",
+                )
+
             if response.status_code != 200:
                 logger.error(f"OpenAI API Error: {response.status_code} - {response.text[:500]}")
                 raise HTTPException(status_code=502, detail=f"Image editing service error: {response.status_code}")
