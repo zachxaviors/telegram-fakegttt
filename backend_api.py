@@ -56,7 +56,10 @@ FONT_CACHE: List[str] = []
 def load_font_cache():
     global FONT_CACHE
     if os.path.isdir(FONTS_DIR):
-        FONT_CACHE = sorted(glob.glob(os.path.join(FONTS_DIR, "*.ttf")))
+        FONT_CACHE = sorted([
+            f for f in glob.glob(os.path.join(FONTS_DIR, "*.ttf"))
+            if not os.path.basename(f).startswith("._")
+        ])
         logger.info(f"Loaded {len(FONT_CACHE)} fonts from {FONTS_DIR}")
     else:
         logger.warning(f"Fonts directory not found: {FONTS_DIR}")
@@ -454,11 +457,14 @@ def render_text_on_canvas(
         
         draw.text((text_x, text_y), new_text, font=font, fill=text_color)
         
-        result_pil = pil_img.filter(ImageFilter.GaussianBlur(radius=0.3))
-        result_np = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
+        result_np = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         
         roi_y0, roi_y1 = max(0, text_y - 2), min(h, text_y + font_size + 4)
         roi_x0, roi_x1 = max(0, text_x - 2), min(w, text_x + text_w + 4)
+        
+        text_roi = result_np[roi_y0:roi_y1, roi_x0:roi_x1].copy()
+        text_roi_blurred = cv2.GaussianBlur(text_roi, (3, 3), sigmaX=0.3)
+        result_np[roi_y0:roi_y1, roi_x0:roi_x1] = text_roi_blurred
         
         original_roi = cleaned_img_np[roi_y0:roi_y1, roi_x0:roi_x1].astype(np.float64)
         rendered_roi = result_np[roi_y0:roi_y1, roi_x0:roi_x1].astype(np.float64)
