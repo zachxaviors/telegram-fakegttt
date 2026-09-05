@@ -344,6 +344,51 @@ def generate_license_key(length: int = 10) -> str:
     return "".join(random.choices(safe_chars, k=length))
 
 
+LOCAL_KEYS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keys.json")
+
+async def load_local_keys() -> dict:
+    try:
+        with open(LOCAL_KEYS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault("keys", [])
+        return data
+    except Exception:
+        return {"keys": []}
+
+async def save_local_keys(keys_data: dict) -> bool:
+    try:
+        with open(LOCAL_KEYS_PATH, "w", encoding="utf-8") as f:
+            json.dump(keys_data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save local keys.json: {e}")
+        return False
+
+async def add_key_to_local_keys(new_key: str, expires: str) -> bool:
+    keys_data = await load_local_keys()
+    keys_data["keys"].append({"key": new_key, "expires": expires})
+    success = await save_local_keys(keys_data)
+    if success:
+        logger.info(f"Added key '{new_key}' to local keys.json")
+    return success
+
+async def delete_key_from_local(target_key: str) -> bool:
+    keys_data = await load_local_keys()
+    normalized = target_key.strip().upper()
+    original_count = len(keys_data["keys"])
+    keys_data["keys"] = [
+        item for item in keys_data["keys"]
+        if (item.get("key") or "").upper() != normalized
+    ]
+    if len(keys_data["keys"]) == original_count:
+        logger.warning(f"Key '{target_key}' not found in local keys.json")
+        return False
+    success = await save_local_keys(keys_data)
+    if success:
+        logger.info(f"Deleted key '{target_key}' from local keys.json")
+    return success
+
+
 # ==============================================================================
 # 6. HANDLER: LỆNH /key - CẤP KEY THUÊ BAO (CHỈ ADMIN ĐƯỢC PHÉP)
 # ==============================================================================
@@ -401,15 +446,14 @@ async def key_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "⏳ Đang tạo Key và đồng bộ lên WebApp..."
         )
 
-        # --- Tự động đẩy Key mới lên file keys.json trên GitHub ---
-        sync_success = await add_key_to_github(formatted_key, expiry_date)
+        # --- Tự động lưu Key vào keys.json trên VPS ---
+        sync_success = await add_key_to_local_keys(formatted_key, expiry_date)
 
         if sync_success:
-            sync_status_line = "✅ Đã đồng bộ lên WebApp, khách có thể dùng ngay."
+            sync_status_line = "✅ Đã lưu vào hệ thống, khách có thể dùng ngay."
         else:
             sync_status_line = (
-                "⚠️ Đồng bộ lên WebApp thất bại. Kiểm tra log Bot hoặc thêm "
-                "Key thủ công vào `keys.json` trên GitHub."
+                "⚠️ Lưu Key thất bại. Kiểm tra log Bot."
             )
 
         reply_text = (
@@ -500,14 +544,7 @@ async def listkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     try:
-        fetched = await fetch_keys_from_github()
-        if fetched is None:
-            await update.message.reply_text(
-                "❌ Không tải được danh sách Key từ GitHub. Vui lòng thử lại sau."
-            )
-            return
-
-        keys_data, _ = fetched
+        keys_data = await load_local_keys()
         message_text, reply_markup = _build_listkey_message(keys_data)
 
         await update.message.reply_text(
@@ -550,7 +587,7 @@ async def delete_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer("⏳ Đang xoá Key...")
 
     try:
-        success = await delete_key_from_github(target_key)
+        success = await delete_key_from_local(target_key)
 
         if not success:
             await query.answer(
@@ -561,21 +598,13 @@ async def delete_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         logger.info("Admin %s (ID: %s) đã xoá Key '%s'", user.full_name, user.id, target_key)
 
-        # --- Tải lại danh sách Key mới nhất và cập nhật lại tin nhắn cũ ---
-        fetched = await fetch_keys_from_github()
-        if fetched is not None:
-            keys_data, _ = fetched
-            message_text, reply_markup = _build_listkey_message(keys_data)
-            await query.edit_message_text(
-                text=f"✅ Đã xoá Key `{target_key}`.\n\n{message_text}",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=reply_markup,
-            )
-        else:
-            await query.edit_message_text(
-                text=f"✅ Đã xoá Key `{target_key}`, nhưng không tải lại được danh sách mới nhất.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+        keys_data = await load_local_keys()
+        message_text, reply_markup = _build_listkey_message(keys_data)
+        await query.edit_message_text(
+            text=f"✅ Đã xoá Key `{target_key}`.\n\n{message_text}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup,
+        )
 
     except Exception as e:
         logger.exception("Lỗi khi xử lý callback xoá Key: %s", e)

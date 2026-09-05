@@ -456,6 +456,24 @@
                 return { valid: false, reason: "Vui lòng nhập Key." };
             }
 
+            try {
+                const response = await fetch(BACKEND_API_URL + "/validate-key", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({key: normalizedKey}),
+                });
+                if (response.ok) {
+                    const result = await response.json();
+                    if (result.valid) {
+                        return { valid: true, key: normalizedKey, expires: result.expires };
+                    } else {
+                        return { valid: false, reason: result.reason || "Key không hợp lệ." };
+                    }
+                }
+            } catch (e) {
+                console.warn("Backend validation failed, falling back to GitHub:", e);
+            }
+
             let licenseKeys;
             try {
                 licenseKeys = await fetchLicenseKeys();
@@ -475,7 +493,6 @@
                 return { valid: false, reason: "Key không tồn tại hoặc không đúng." };
             }
 
-            // So sánh ngày hết hạn (tính đến hết ngày expires, giờ 23:59:59)
             const expiryDate = new Date(`${found.expires}T23:59:59`);
             const now = new Date();
 
@@ -573,6 +590,7 @@
         //   1. Truy cập https://api.imgbb.com/
         //   2. Đăng nhập bằng Google/Email (miễn phí, không cần thẻ)
         //   3. Copy "API key" được cấp và dán vào biến bên dưới
+        const BACKEND_API_URL = "{{BACKEND_API_URL}}";
         const IMGBB_API_KEY = "{{IMGBB_API_KEY}}";
 
         // ==========================================================

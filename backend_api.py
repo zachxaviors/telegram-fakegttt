@@ -862,6 +862,8 @@ async def serve_webapp():
         with open(index_path, "r", encoding="utf-8") as f:
             content = f.read()
         content = content.replace("{{IMGBB_API_KEY}}", IMGBB_API_KEY)
+        backend_url = os.getenv("WEBAPP_BACKEND_URL", "http://103.85.246.88:8080")
+        content = content.replace("{{BACKEND_API_URL}}", backend_url)
         return HTMLResponse(content=content)
     return HTMLResponse(content="<h1>WebApp not found</h1>", status_code=404)
 
