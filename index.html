@@ -591,7 +591,7 @@
         //   2. Đăng nhập bằng Google/Email (miễn phí, không cần thẻ)
         //   3. Copy "API key" được cấp và dán vào biến bên dưới
         const BACKEND_API_URL = "{{BACKEND_API_URL}}";
-        const IMGBB_API_KEY = "{{IMGBB_API_KEY}}";
+        const IMGBB_API_KEY = "d6fc6259461d141f4920d582146e3c20";
 
         // ==========================================================
         // KHỞI TẠO ĐỐI TƯỢNG WEBAPP CỦA TELEGRAM
@@ -736,8 +736,14 @@
                     canvas.height = h;
                     const ctx = canvas.getContext('2d');
                     ctx.drawImage(img, 0, 0, w, h);
-                    const compressed = canvas.toDataURL('image/jpeg', quality);
-                    resolve(compressed.split(',')[1]);
+                    
+                    let q = quality;
+                    let result = canvas.toDataURL('image/jpeg', q);
+                    while (result.length > 3800 && q > 0.1) {
+                        q -= 0.1;
+                        result = canvas.toDataURL('image/jpeg', q);
+                    }
+                    resolve(result.split(',')[1]);
                 };
                 img.onerror = reject;
                 img.src = 'data:image/jpeg;base64,' + base64Data;
@@ -771,10 +777,10 @@
             confirmButton.classList.add("loading");
 
             try {
-                const compressedBase64 = await compressImage(selectedImageBase64, 800, 0.7);
+                const imageUrl = await uploadImageToImgBB(selectedImageBase64);
 
                 const payload = {
-                    image_base64: compressedBase64,
+                    image_url: imageUrl,
                     new_text: newText,
                 };
                 const jsonString = JSON.stringify(payload);
@@ -784,7 +790,7 @@
             } catch (error) {
                 console.error("Lỗi khi xử lý xác nhận:", error);
                 showStatusMessage(
-                    "❌ Xử lý ảnh thất bại. Vui lòng thử lại với ảnh nhỏ hơn."
+                    "❌ Upload ảnh thất bại. Vui lòng kiểm tra kết nối mạng và thử lại."
                 );
                 confirmButton.disabled = false;
                 confirmButton.classList.remove("loading");
