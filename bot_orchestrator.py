@@ -67,7 +67,10 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 WEB_APP_URL: str = os.getenv("WEB_APP_URL", "https://zachxaviors.github.io/telegram-fakegttt/")
 
 # --- URL FastAPI Backend ---
-BACKEND_API_URL: str = os.getenv("BACKEND_API_URL", "http://localhost:8000")
+BACKEND_API_URL: str = os.getenv("BACKEND_API_URL", "http://localhost:8080")
+
+# --- Internal API Key for backend auth ---
+INTERNAL_API_KEY: str = os.getenv("INTERNAL_API_KEY", "bot-internal-secret-key-2026")
 
 # --- ID Telegram của (các) người dùng được phép dùng lệnh /key ---
 AUTHORIZED_KEY_ADMIN_IDS: list[int] = [int(x) for x in os.getenv("AUTHORIZED_KEY_ADMIN_IDS", "8329365661").split(",")]
@@ -111,7 +114,7 @@ async def call_backend_inpaint(image_url: str, new_text: str, progress_callback=
     if progress_callback:
         await progress_callback("🔍 Đang phân tích tọa độ và font chữ...")
 
-    async with httpx.AsyncClient(timeout=180.0) as client:
+    async with httpx.AsyncClient(timeout=180.0, headers={"Authorization": f"Bearer {INTERNAL_API_KEY}"}) as client:
         ocr_resp = await client.post(
             f"{BACKEND_API_URL}/ocr",
             json={"image_base64": image_base64},
@@ -141,7 +144,12 @@ async def call_backend_inpaint(image_url: str, new_text: str, progress_callback=
         processing_ms = inpaint_resp.headers.get("X-Processing-Time-Ms", "?")
         
         if progress_callback:
-            method_label = "font matching cục bộ" if render_method == "local-font" else "AI inpainting"
+            method_labels = {
+                "local-font": "font matching cục bộ",
+                "glyph-composite": "tái tạo ký tự từ ảnh gốc",
+                "api-inpaint": "AI inpainting",
+            }
+            method_label = method_labels.get(render_method, render_method)
             await progress_callback(f"🎨 Đang hoàn thiện ảnh ({method_label}, {processing_ms}ms)...")
 
         buf = io.BytesIO(inpaint_resp.content)

@@ -74,7 +74,7 @@ CCCD_FONT_PRIORITY = [
     "HelveticaNeue-Bold",
 ]
 
-app = FastAPI(title="ID Card Inpainting API v4")
+app = FastAPI(title="ID Card Inpainting API v5")
 
 ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 app.add_middleware(
@@ -84,6 +84,25 @@ app.add_middleware(
     allow_methods=["POST", "GET"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "bot-internal-secret-key-2026")
+
+IMGBB_API_KEY = os.getenv("IMGBB_API_KEY", "")
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if request.url.path in ["/health", "/docs", "/openapi.json"]:
+        return await call_next(request)
+    
+    if request.url.path == "/validate-key":
+        return await call_next(request)
+    
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != INTERNAL_API_KEY:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    
+    return await call_next(request)
 
 
 # ==============================================================================
@@ -647,6 +666,65 @@ async def call_openai_edit_api_secure(image_bytes: bytes, mask_buffer: io.BytesI
 
 
 # ==============================================================================
+# LICENSE VALIDATION & IMGBB PROXY
+# ==============================================================================
+
+class KeyValidationRequest(BaseModel):
+    key: str = Field(..., min_length=1)
+
+@app.post("/validate-key")
+async def validate_license_key(req: KeyValidationRequest):
+    keys_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keys.json")
+    try:
+        with open(keys_path, "r", encoding="utf-8") as f:
+            keys_data = json.load(f)
+    except Exception:
+        return {"valid": False, "reason": "Keys file not available"}
+    
+    normalized_input = req.key.strip().upper()
+    today = time.strftime("%Y-%m-%d")
+    
+    for item in keys_data.get("keys", []):
+        stored_key = (item.get("key") or "").strip().upper()
+        expires = item.get("expires", "")
+        
+        if stored_key == normalized_input:
+            if expires >= today:
+                return {"valid": True, "expires": expires}
+            else:
+                return {"valid": False, "reason": "Key expired"}
+    
+    return {"valid": False, "reason": "Key not found"}
+
+class ImgBBUploadRequest(BaseModel):
+    image_base64: str = Field(..., min_length=100)
+
+@app.post("/upload-image")
+async def upload_image_proxy(req: ImgBBUploadRequest):
+    if not IMGBB_API_KEY:
+        raise HTTPException(status_code=500, detail="IMGBB_API_KEY not configured")
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.imgbb.com/1/upload",
+                data={"key": IMGBB_API_KEY, "image": req.image_base64},
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+            if result.get("success"):
+                return {"url": result["data"]["url"], "display_url": result["data"]["display_url"]}
+            else:
+                raise HTTPException(status_code=502, detail="ImgBB upload failed")
+                
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="ImgBB timeout")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"ImgBB error: {e.response.status_code}")
+
+
+# ==============================================================================
 # PRODUCTION ENDPOINTS
 # ==============================================================================
 
@@ -782,7 +860,9 @@ async def serve_webapp():
     index_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
     if os.path.exists(index_path):
         with open(index_path, "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
+            content = f.read()
+        content = content.replace("{{IMGBB_API_KEY}}", IMGBB_API_KEY)
+        return HTMLResponse(content=content)
     return HTMLResponse(content="<h1>WebApp not found</h1>", status_code=404)
 
 @app.get("/keys.json")
