@@ -684,7 +684,7 @@ async def inpaint_image(req: InpaintRequest):
             result_buffer.seek(0)
             
             total_time = time.time() - start_time
-            logger.info(f"Local rendering completed in {total_time:.2f}s")
+            logger.info(f"Local font rendering completed in {total_time:.2f}s")
             
             return StreamingResponse(
                 result_buffer,
@@ -696,7 +696,35 @@ async def inpaint_image(req: InpaintRequest):
                 }
             )
         
-        logger.info("Local rendering unavailable, falling back to API inpainting")
+        logger.info("Font rendering unavailable, trying glyph compositing fallback")
+        glyph_result = await loop.run_in_executor(
+            THREAD_POOL,
+            composite_from_glyphs,
+            cleaned_np,
+            req.coordinates,
+            req.prompt,
+            (w, h),
+        )
+        
+        if glyph_result is not None and glyph_result.size > 0:
+            _, buf = cv2.imencode('.jpg', glyph_result, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            result_buffer = io.BytesIO(buf.tobytes())
+            result_buffer.seek(0)
+            
+            total_time = time.time() - start_time
+            logger.info(f"Glyph compositing completed in {total_time:.2f}s")
+            
+            return StreamingResponse(
+                result_buffer,
+                media_type="image/jpeg",
+                headers={
+                    "X-Processing-Time-Ms": str(round(total_time * 1000)),
+                    "X-Original-Dimensions": f"{w}x{h}",
+                    "X-Render-Method": "glyph-composite",
+                }
+            )
+        
+        logger.info("Glyph compositing unavailable, falling back to API inpainting")
         mask_buffer = create_mask_with_perspective(cleaned_image_bytes, req.coordinates, (w, h))
 
         result_image_buffer = await call_openai_edit_api_secure(
@@ -770,4 +798,5 @@ async def shutdown_event():
     logger.info("Thread pool shut down gracefully")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
+    port = int(os.getenv("BACKEND_PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
