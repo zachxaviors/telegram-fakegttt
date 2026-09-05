@@ -47,6 +47,9 @@ if not CKEY_API_KEY or not OPENAI_API_KEY:
 
 THREAD_POOL = ThreadPoolExecutor(max_workers=4)
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("InpaintingService")
+
 FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 FONT_CACHE: List[str] = []
 
@@ -67,9 +70,6 @@ CCCD_FONT_PRIORITY = [
     "Helvetica-Bold",
     "HelveticaNeue-Bold",
 ]
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("InpaintingService")
 
 app = FastAPI(title="ID Card Inpainting API v4")
 
