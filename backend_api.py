@@ -21,7 +21,8 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from pydantic import BaseModel, Field, validator
 
@@ -741,6 +742,21 @@ async def health_check():
         "timestamp": time.time(),
         "config_loaded": bool(CKEY_API_KEY and OPENAI_API_KEY)
     }
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_webapp():
+    index_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(content="<h1>WebApp not found</h1>", status_code=404)
+
+@app.get("/keys.json")
+async def serve_keys():
+    keys_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keys.json")
+    if os.path.exists(keys_path):
+        return FileResponse(keys_path, media_type="application/json")
+    return {"keys": []}
 
 @app.on_event("shutdown")
 async def shutdown_event():
