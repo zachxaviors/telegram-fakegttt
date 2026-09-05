@@ -747,7 +747,279 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 
 
 # ==============================================================================
-# 12. HÀM MAIN - KHỞI TẠO VÀ CHẠY BOT
+# 12. HANDLER: NHẬN ẢNH TRỰC TIẾP TỪ TIN NHẮN + DEBUG HTML
+# ==============================================================================
+async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    caption = update.message.caption or ""
+
+    if not caption.strip():
+        await update.message.reply_text(
+            "⚠️ Vui lòng gửi ảnh kèm caption chứa text mới muốn thay thế.\n"
+            "Ví dụ: Gửi ảnh CCCD + caption \"NGUYEN VAN A\""
+        )
+        return
+
+    processing_msg = await update.message.reply_text(
+        "📥 Đã nhận ảnh! Đang xử lý...\n⏳ Vui lòng chờ 10-30 giây."
+    )
+
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
+
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = await file.download_as_bytearray()
+        image_base64 = base64.b64encode(bytes(image_bytes)).decode("utf-8")
+
+        async def update_progress(status_text: str):
+            try:
+                await processing_msg.edit_text(status_text)
+            except Exception:
+                pass
+
+        await update_progress("🔍 Đang phân tích tọa độ và font chữ...")
+
+        async with httpx.AsyncClient(timeout=180.0, headers={"Authorization": f"Bearer {INTERNAL_API_KEY}"}) as client:
+            ocr_resp = await client.post(
+                f"{BACKEND_API_URL}/ocr",
+                json={"image_base64": image_base64},
+            )
+
+            if ocr_resp.status_code != 200:
+                error_html = generate_debug_html(
+                    image_base64=image_base64,
+                    coordinates={},
+                    error=f"OCR Error: {ocr_resp.status_code} - {ocr_resp.text[:500]}",
+                    stage="ocr",
+                )
+                await processing_msg.edit_text(
+                    f"❌ Lỗi OCR (HTTP {ocr_resp.status_code}).\nĐã tạo file debug.",
+                )
+                debug_buf = io.BytesIO(error_html.encode("utf-8"))
+                debug_buf.name = "debug_ocr.html"
+                await context.bot.send_document(chat_id=chat_id, document=debug_buf, filename="debug_ocr.html")
+                return
+
+            ocr_data = ocr_resp.json()
+            coordinates = ocr_data.get("coordinates", {})
+
+            if not coordinates:
+                error_html = generate_debug_html(
+                    image_base64=image_base64,
+                    coordinates={},
+                    error="OCR returned empty coordinates",
+                    stage="ocr",
+                )
+                await processing_msg.edit_text("❌ Không tìm thấy tọa độ text trên ảnh.")
+                debug_buf = io.BytesIO(error_html.encode("utf-8"))
+                debug_buf.name = "debug_ocr.html"
+                await context.bot.send_document(chat_id=chat_id, document=debug_buf, filename="debug_ocr.html")
+                return
+
+            await update_progress(f"✏️ Tọa độ: {json.dumps(coordinates)}\n⏳ Đang xóa chữ cũ và tái tạo ký tự...")
+
+            inpaint_resp = await client.post(
+                f"{BACKEND_API_URL}/inpaint",
+                json={
+                    "image_base64": image_base64,
+                    "coordinates": coordinates,
+                    "prompt": caption.strip(),
+                },
+            )
+
+            if inpaint_resp.status_code != 200:
+                error_html = generate_debug_html(
+                    image_base64=image_base64,
+                    coordinates=coordinates,
+                    error=f"Inpaint Error: {inpaint_resp.status_code} - {inpaint_resp.text[:500]}",
+                    stage="inpaint",
+                )
+                await processing_msg.edit_text(f"❌ Lỗi Inpaint (HTTP {inpaint_resp.status_code}).")
+                debug_buf = io.BytesIO(error_html.encode("utf-8"))
+                debug_buf.name = "debug_inpaint.html"
+                await context.bot.send_document(chat_id=chat_id, document=debug_buf, filename="debug_inpaint.html")
+                return
+
+            render_method = inpaint_resp.headers.get("X-Render-Method", "unknown")
+            processing_ms = inpaint_resp.headers.get("X-Processing-Time-Ms", "?")
+
+            result_buf = io.BytesIO(inpaint_resp.content)
+            result_buf.seek(0)
+
+            debug_html = generate_debug_html(
+                image_base64=image_base64,
+                coordinates=coordinates,
+                result_image_base64=base64.b64encode(inpaint_resp.content).decode("utf-8"),
+                render_method=render_method,
+                processing_ms=processing_ms,
+                new_text=caption.strip(),
+                stage="success",
+            )
+
+        await processing_msg.delete()
+
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=result_buf,
+            caption=f"🎉 Xử lý hoàn tất!\n🔧 Phương pháp: {render_method}\n⏱ Thời gian: {processing_ms}ms",
+        )
+
+        debug_buf = io.BytesIO(debug_html.encode("utf-8"))
+        debug_buf.name = "debug_result.html"
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=debug_buf,
+            filename="debug_result.html",
+            caption="📋 File debug: mở trên trình duyệt để xem tọa độ bounding box + so sánh ảnh gốc/kết quả.",
+        )
+
+        logger.info(f"Photo message processed for user {user.id}: method={render_method}, time={processing_ms}ms")
+
+    except Exception as e:
+        logger.exception(f"Error processing photo message: {e}")
+        await processing_msg.edit_text(f"❌ Lỗi xử lý: {str(e)[:200]}")
+
+
+def generate_debug_html(
+    image_base64: str,
+    coordinates: dict,
+    error: str = "",
+    stage: str = "",
+    result_image_base64: str = "",
+    render_method: str = "",
+    processing_ms: str = "",
+    new_text: str = "",
+) -> str:
+    coord_json = json.dumps(coordinates, indent=2, ensure_ascii=False)
+
+    boxes_overlay_js = ""
+    if coordinates:
+        boxes_js_items = []
+        colors = {"name_text": "red", "dob_text": "blue", "name": "red", "dob": "blue"}
+        for key, bbox in coordinates.items():
+            if isinstance(bbox, list) and len(bbox) == 4:
+                color = colors.get(key, "lime")
+                boxes_js_items.append(
+                    f'{{key:"{key}", ymin:{bbox[0]}, xmin:{bbox[1]}, ymax:{bbox[2]}, xmax:{bbox[3]}, color:"{color}"}}'
+                )
+        boxes_overlay_js = f"const BOXES = [{','.join(boxes_js_items)}];"
+
+    html = f"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Debug - Stage: {stage}</title>
+<style>
+body {{ font-family: Arial, sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }}
+h1 {{ color: #e94560; }}
+.section {{ background: #16213e; border-radius: 8px; padding: 15px; margin: 15px 0; }}
+.section h2 {{ color: #0f3460; background: #e94560; color: white; padding: 8px 12px; border-radius: 4px; display: inline-block; }}
+.error {{ background: #4a0e0e; border: 1px solid #e94560; padding: 15px; border-radius: 8px; color: #ff6b6b; }}
+.success {{ background: #0e4a1e; border: 1px solid #4caf50; padding: 15px; border-radius: 8px; color: #81c784; }}
+pre {{ background: #0a0a1a; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 13px; }}
+.image-container {{ position: relative; display: inline-block; margin: 10px; }}
+.image-container img {{ max-width: 100%; max-height: 500px; border: 2px solid #333; border-radius: 4px; }}
+.overlay-box {{ position: absolute; border: 2px solid; pointer-events: none; }}
+.overlay-label {{ position: absolute; top: -20px; left: 0; font-size: 11px; font-weight: bold; padding: 1px 4px; border-radius: 2px; white-space: nowrap; }}
+.meta {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+.meta-item {{ background: #0a0a1a; padding: 8px 12px; border-radius: 4px; }}
+.meta-label {{ color: #888; font-size: 12px; }}
+.meta-value {{ color: #fff; font-size: 16px; font-weight: bold; }}
+.compare {{ display: flex; gap: 20px; flex-wrap: wrap; }}
+.compare > div {{ flex: 1; min-width: 300px; }}
+</style>
+</head>
+<body>
+<h1>🔍 Debug Report - {stage.upper()}</h1>
+
+<div class="section">
+<h2>Thông tin</h2>
+<div class="meta">
+<div class="meta-item"><div class="meta-label">Stage</div><div class="meta-value">{stage}</div></div>
+<div class="meta-item"><div class="meta-label">Render Method</div><div class="meta-value">{render_method or 'N/A'}</div></div>
+<div class="meta-item"><div class="meta-label">Processing Time</div><div class="meta-value">{processing_ms or 'N/A'} ms</div></div>
+<div class="meta-item"><div class="meta-label">New Text</div><div class="meta-value">{new_text or 'N/A'}</div></div>
+</div>
+</div>
+
+{"<div class='error'><strong>❌ ERROR:</strong><br>" + error + "</div>" if error else ""}
+{"<div class='success'><strong>✅ SUCCESS</strong> - Ảnh đã xử lý thành công.</div>" if stage == "success" else ""}
+
+<div class="section">
+<h2>Tọa độ OCR</h2>
+<pre>{coord_json}</pre>
+</div>
+
+<div class="section">
+<h2>Ảnh gốc + Bounding Boxes</h2>
+<div class="image-container" id="original-container">
+<img id="original-img" src="data:image/jpeg;base64,{image_base64}" onload="drawBoxes()">
+</div>
+</div>
+
+{f'''<div class="section">
+<h2>So sánh Gốc vs Kết quả</h2>
+<div class="compare">
+<div><h3>Ảnh gốc</h3><img src="data:image/jpeg;base64,{image_base64}" style="max-width:100%;max-height:400px;border:2px solid #333;border-radius:4px;"></div>
+<div><h3>Ảnh kết quả ({render_method})</h3><img src="data:image/jpeg;base64,{result_image_base64}" style="max-width:100%;max-height:400px;border:2px solid #4caf50;border-radius:4px;"></div>
+</div>
+</div>''' if result_image_base64 else ""}
+
+<script>
+{boxes_overlay_js}
+function drawBoxes() {{
+    const img = document.getElementById('original-img');
+    const container = document.getElementById('original-container');
+    const w = img.naturalWidth;
+    const h = img.naturalHeight;
+    const dispW = img.clientWidth;
+    const dispH = img.clientHeight;
+    const scaleX = dispW / w;
+    const scaleY = dispH / h;
+    
+    if (typeof BOXES !== 'undefined') {{
+        BOXES.forEach(b => {{
+            const maxVal = Math.max(b.ymin, b.xmin, b.ymax, b.xmax);
+            let scale = 1000;
+            if (maxVal <= 1.0) scale = 1.0;
+            else if (maxVal <= 1000) scale = 1000;
+            else scale = Math.max(w, h);
+            
+            const x0 = (b.xmin / scale) * dispW;
+            const y0 = (b.ymin / scale) * dispH;
+            const x1 = (b.xmax / scale) * dispW;
+            const y1 = (b.ymax / scale) * dispH;
+            
+            const box = document.createElement('div');
+            box.className = 'overlay-box';
+            box.style.left = x0 + 'px';
+            box.style.top = y0 + 'px';
+            box.style.width = (x1 - x0) + 'px';
+            box.style.height = (y1 - y0) + 'px';
+            box.style.borderColor = b.color;
+            
+            const label = document.createElement('div');
+            label.className = 'overlay-label';
+            label.textContent = b.key;
+            label.style.background = b.color;
+            label.style.color = 'white';
+            box.appendChild(label);
+            
+            container.appendChild(box);
+        }});
+    }}
+}}
+</script>
+</body>
+</html>"""
+    return html
+
+
+# ==============================================================================
+# 13. HÀM MAIN - KHỞI TẠO VÀ CHẠY BOT
 # ==============================================================================
 def main() -> None:
     """
@@ -776,6 +1048,11 @@ def main() -> None:
     # --- Đăng ký handler "Cổng tiếp nhận dữ liệu" từ WebApp ---
     application.add_handler(
         MessageHandler(filters.StatusUpdate.WEB_APP_DATA, web_app_data_handler)
+    )
+
+    # --- Đăng ký handler nhận ảnh trực tiếp từ tin nhắn ---
+    application.add_handler(
+        MessageHandler(filters.PHOTO, photo_message_handler)
     )
 
     # --- Đăng ký handler bắt lỗi toàn cục ---
